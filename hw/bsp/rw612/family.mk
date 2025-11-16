@@ -46,7 +46,8 @@ SRC_C += \
 	$(SDK_DRIVERS)/fsl_flexcomm.c \
 	$(SDK_DRIVERS)/fsl_usart.c \
 	$(SDK_DRIVERS)/fsl_common.c \
-	$(SDK_DRIVERS)/fsl_common_arm.c
+	$(SDK_DRIVERS)/fsl_common_arm.c \
+	$(TOP)/../../flash_config/flash_config.c
 
 # Note: ELS/PKC crypto library disabled - missing platform headers
 # SRC_C += \
@@ -62,7 +63,8 @@ INC += \
 	$(SDK_DRIVERS) \
 	$(SDK_UTILITIES) \
 	$(SDK_UTILITIES_STR) \
-	$(SDK_COMPONENT)
+	$(SDK_COMPONENT) \
+	$(TOP)/../../flash_config
 
 # Note: ELS/PKC include paths disabled - missing platform headers
 #	$(SDK_COMPONENT_ELS)/src/comps/mcuxClBuffer/inc \
