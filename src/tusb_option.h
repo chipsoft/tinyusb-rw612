@@ -200,6 +200,7 @@
 // NXP LPC MCX
 #define OPT_MCU_MCXN9            2300  ///< NXP MCX N9 Series
 #define OPT_MCU_MCXA15           2301  ///< NXP MCX A15 Series
+#define OPT_MCU_RW612            2302  ///< NXP RW612 Wireless MCU Series
 
 // Analog Devices
 #define OPT_MCU_MAX32690         2400  ///< ADI MAX32690
