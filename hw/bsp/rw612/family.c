@@ -83,11 +83,43 @@ void board_init(void) {
   USART_Init(UART_DEV, &uart_config, CLOCK_GetFlexCommClkFreq(UART_FLEXCOMM_INST));
 #endif
 
-  // USB Controller Initialization for RW612
-  // USB clock is configured by BOARD_BootClockRUN()
-  // Just enable the clock gate and reset the peripheral
+  //------------- USB Controller and PHY Initialization (based on MCX MCXN9) -------------//
+
+  // Step 1: Enable USB controller clock
   CLOCK_EnableClock(kCLOCK_Usb);
+
+  // Step 2: Reset USB controller
   RESET_PeripheralReset(kUSB_RST_SHIFT_RSTn);
+
+  // Step 3: Initialize USB PHY (based on hw/bsp/mcx/family.c:168-184)
+  #ifdef USBPHY
+    // Enable USB PHY clock if separate from controller clock
+    #ifdef kCLOCK_UsbPhy
+      CLOCK_EnableClock(kCLOCK_UsbPhy);
+    #endif
+
+    // Override trim values (if needed - similar to MCX)
+    #if !defined(FSL_FEATURE_SOC_CCM_ANALOG_COUNT) && !defined(FSL_FEATURE_SOC_ANATOP_COUNT)
+      USBPHY->TRIM_OVERRIDE_EN = 0x001fU;  /* override IFR value */
+    #endif
+
+    // Enable PHY support for Low-speed device + LS via FS Hub
+    USBPHY->CTRL |= USBPHY_CTRL_SET_ENUTMILEVEL2_MASK | USBPHY_CTRL_SET_ENUTMILEVEL3_MASK;
+
+    // Enable all power for normal operation - CRITICAL!
+    USBPHY->PWD = 0;
+
+    // TX Timing calibration (using MCX values as reference)
+    uint32_t phytx = USBPHY->TX;
+    phytx &= ~(USBPHY_TX_D_CAL_MASK | USBPHY_TX_TXCAL45DM_MASK | USBPHY_TX_TXCAL45DP_MASK);
+    phytx |= USBPHY_TX_D_CAL(0x04) | USBPHY_TX_TXCAL45DP(0x07) | USBPHY_TX_TXCAL45DM(0x07);
+    USBPHY->TX = phytx;
+  #else
+    // USBPHY peripheral not found in device headers
+    // This is expected if USB PHY is integrated in USBOTG controller or not exposed
+    // USB may still work if PHY is auto-initialized by hardware
+    #warning "USBPHY peripheral not found - USB PHY initialization skipped"
+  #endif
 }
 
 //--------------------------------------------------------------------+
