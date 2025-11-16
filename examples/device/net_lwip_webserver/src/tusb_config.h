@@ -95,7 +95,7 @@ extern "C" {
 #elif TU_CHECK_MCU(OPT_MCU_MAX32690, OPT_MCU_MAX32650, OPT_MCU_MAX32666, OPT_MCU_MAX78002)
   #define USE_ECM 1
 #elif TU_CHECK_MCU(OPT_MCU_RW612)
-  #define USE_ECM 1
+  #define USE_ECM 0  // Use NCM (0) instead of RNDIS/ECM (1) for Windows 10+ compatibility
   #define INCLUDE_IPERF
 #else
   #define USE_ECM 0
