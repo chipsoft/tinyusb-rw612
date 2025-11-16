@@ -91,7 +91,7 @@ static const tusb_desc_device_t desc_device = {
   .iProduct      = STRID_PRODUCT,
   .iSerialNumber = STRID_SERIAL,
 
-  .bNumConfigurations = CONFIG_ID_COUNT // multiple configurations
+  .bNumConfigurations = 1 // Single configuration for Windows compatibility (RNDIS only)
 };
 
 // Invoked when received GET DEVICE DESCRIPTOR

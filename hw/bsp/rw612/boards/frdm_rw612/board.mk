@@ -1,0 +1,14 @@
+MCU_VARIANT = RW612
+MCU_CORE = RW612_cm33
+PORT ?= 0
+
+CPU_CORE = cortex-m33-nodsp-nofp
+CFLAGS += \
+	-DCPU_RW612ETA2I \
+	-DCFG_TUSB_MCU=OPT_MCU_RW612 \
+
+JLINK_DEVICE = RW612_M33
+PYOCD_TARGET = RW612
+
+# flash using jlink
+flash: flash-jlink
