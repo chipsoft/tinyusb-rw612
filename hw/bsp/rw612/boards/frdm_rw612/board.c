@@ -14,7 +14,7 @@
 #include "fsl_io_mux.h"
 #include "fsl_power.h"
 #include "fsl_ocotp.h"
-#include "mcuxClEls.h"
+// #include "mcuxClEls.h"  // Disabled - ELS crypto library not included
 
 /*******************************************************************************
  * Definitions
@@ -300,6 +300,7 @@ void BOARD_SetFlexspiClock(FLEXSPI_Type *base, uint32_t src, uint32_t divider)
     }
 }
 
+#if 0  // Disabled - requires ELS crypto library
 static bool LoadGdetCfg(power_gdet_data_t *data)
 {
     bool retval = true;
@@ -391,13 +392,14 @@ static void ConfigSvcSensor(void)
         SDK_DelayAtLeastUs(600, SystemCoreClock);
     }
 }
+#endif  // ELS crypto library
 
 /* This function is used to configure static voltage compansation and sensors, and in XIP case, change FlexSPI clock
    to a stable source before clock tree(Such as PLL and Main clock) update */
 void BOARD_ClockPreConfig(void)
 {
     OCOTP_OtpInit();
-    ConfigSvcSensor();
+    // ConfigSvcSensor();  // Disabled - requires ELS crypto library
     OCOTP_OtpDeinit();
 
     if (BOARD_IS_XIP())
