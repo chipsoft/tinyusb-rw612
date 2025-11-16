@@ -1,42 +1,72 @@
-# TinyUSB Development Guide
+# TinyUSB Development Guide for RW612
+
+This is a TinyUSB fork customized for the **NXP RW612** board with integrated lwIP networking stack.
+
+## RW612-Specific Information
+
+### Board Details
+- **Board**: NXP FRDM-RW612
+- **MCU**: RW612 (Cortex-M33)
+- **USB Driver**: ChipIdea High-Speed (ci_hs)
+- **Network Stack**: lwIP integration for network examples
+- **Network Class**: NCM (Network Control Model) - Windows 10+ compatible
+
+### Key Differences from Upstream TinyUSB
+- RW612 BSP (Board Support Package) in `hw/bsp/rw612/`
+- lwIP networking stack integration
+- NCM driver enabled instead of RNDIS for better Windows 10+ compatibility
+- FreeRTOS configuration for RW612
+
+### SDK Requirements
+This repository expects the NXP RW612 SDK to be available in the parent directory structure:
+- SDK drivers should be in `../../drivers/`
+- SDK device files in `../../device/`
+- SDK CMSIS in `../../CMSIS/`
+- SDK startup files in `../../startup/`
+
+The build system will automatically locate these based on the project structure.
 
 ## Build Commands
 
 ### CMake Build System (Preferred)
 CMake with Ninja is the preferred build method for TinyUSB development.
 
-- Build example with Ninja:
+- Build example for RW612 with Ninja:
   ```bash
   cd examples/device/cdc_msc
   mkdir build && cd build
-  cmake -G Ninja -DBOARD=raspberry_pi_pico ..
+  cmake -G Ninja -DBOARD=frdm_rw612 ..
   ninja
   ```
-- Debug build: `cmake -G Ninja -DBOARD=raspberry_pi_pico -DCMAKE_BUILD_TYPE=Debug ..`
-- With logging: `cmake -G Ninja -DBOARD=raspberry_pi_pico -DLOG=2 ..`
-- With RTT logger: `cmake -G Ninja -DBOARD=raspberry_pi_pico -DLOG=2 -DLOGGER=rtt ..`
+- Debug build: `cmake -G Ninja -DBOARD=frdm_rw612 -DCMAKE_BUILD_TYPE=Debug ..`
+- With logging: `cmake -G Ninja -DBOARD=frdm_rw612 -DLOG=2 ..`
+- With RTT logger: `cmake -G Ninja -DBOARD=frdm_rw612 -DLOG=2 -DLOGGER=rtt ..`
 - Flash with JLink: `ninja cdc_msc-jlink`
 - Flash with OpenOCD: `ninja cdc_msc-openocd`
-- Generate UF2: `ninja cdc_msc-uf2`
 - List all targets: `ninja -t targets`
 
 ### Make Build System (Alternative)
-- Build example: `cd examples/device/cdc_msc && make BOARD=raspberry_pi_pico all`
-- For specific example: `cd examples/{device|host|dual}/{example_name} && make BOARD=raspberry_pi_pico all`
-- Flash with JLink: `make BOARD=raspberry_pi_pico flash-jlink`
-- Flash with OpenOCD: `make BOARD=raspberry_pi_pico flash-openocd`
-- Debug build: `make BOARD=raspberry_pi_pico DEBUG=1 all`
-- With logging: `make BOARD=raspberry_pi_pico LOG=2 all`
-- With RTT logger: `make BOARD=raspberry_pi_pico LOG=2 LOGGER=rtt all`
-- Generate UF2: `make BOARD=raspberry_pi_pico all uf2`
+- Build example: `cd examples/device/cdc_msc && make BOARD=frdm_rw612 all`
+- For specific example: `cd examples/{device|host|dual}/{example_name} && make BOARD=frdm_rw612 all`
+- Flash with JLink: `make BOARD=frdm_rw612 flash-jlink`
+- Flash with OpenOCD: `make BOARD=frdm_rw612 flash-openocd`
+- Debug build: `make BOARD=frdm_rw612 DEBUG=1 all`
+- With logging: `make BOARD=frdm_rw612 LOG=2 all`
+- With RTT logger: `make BOARD=frdm_rw612 LOG=2 LOGGER=rtt all`
 
 ### Additional Options
 - Select RootHub port: `RHPORT_DEVICE=1` (make) or `-DRHPORT_DEVICE=1` (cmake)
 - Set port speed: `RHPORT_DEVICE_SPEED=OPT_MODE_FULL_SPEED` (make) or `-DRHPORT_DEVICE_SPEED=OPT_MODE_FULL_SPEED` (cmake)
 
 ### Dependencies
-- Get dependencies: `python tools/get_deps.py rp2040`
-- Or from example: `cd examples/device/cdc_msc && make BOARD=raspberry_pi_pico get-deps`
+- Get dependencies: `python tools/get_deps.py rw612`
+- Or from example: `cd examples/device/cdc_msc && make BOARD=frdm_rw612 get-deps`
+
+### RW612-Specific Examples
+- **net_lwip_webserver**: Network example with lwIP web server (recommended for RW612)
+- **cdc_msc**: Combined CDC and Mass Storage device
+- **cdc_msc_freertos**: CDC/MSC with FreeRTOS support
+- All standard TinyUSB examples are available for RW612
 
 ### Testing
 - Run unit tests: `cd test/unit-test && ceedling test:all`
