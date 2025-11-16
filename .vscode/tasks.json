@@ -1,0 +1,172 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Build NCM for RW612",
+      "type": "shell",
+      "command": "cmake",
+      "args": [
+        "-G",
+        "Ninja",
+        "-DBOARD=frdm_rw612",
+        ".."
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}/examples/device/net_lwip_webserver/build"
+      },
+      "problemMatcher": [],
+      "group": {
+        "kind": "build",
+        "isDefault": false
+      },
+      "dependsOn": ["Create build directory"],
+      "presentation": {
+        "echo": true,
+        "reveal": "always",
+        "focus": false,
+        "panel": "shared",
+        "showReuseMessage": true,
+        "clear": false
+      },
+      "detail": "Configure and build net_lwip_webserver with NCM for RW612"
+    },
+    {
+      "label": "Build NCM (Ninja)",
+      "type": "shell",
+      "command": "ninja",
+      "args": [],
+      "options": {
+        "cwd": "${workspaceFolder}/examples/device/net_lwip_webserver/build"
+      },
+      "problemMatcher": [
+        "$gcc"
+      ],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "dependsOn": ["Build NCM for RW612"],
+      "presentation": {
+        "echo": true,
+        "reveal": "always",
+        "focus": false,
+        "panel": "shared",
+        "showReuseMessage": true,
+        "clear": false
+      },
+      "detail": "Run ninja to compile NCM example for RW612"
+    },
+    {
+      "label": "Rebuild NCM for RW612",
+      "type": "shell",
+      "command": "echo",
+      "args": [
+        "Rebuilding NCM for RW612..."
+      ],
+      "dependsOn": [
+        "Clean NCM build",
+        "Build NCM (Ninja)"
+      ],
+      "dependsOrder": "sequence",
+      "problemMatcher": [],
+      "group": "build",
+      "presentation": {
+        "echo": true,
+        "reveal": "always",
+        "focus": false,
+        "panel": "shared",
+        "showReuseMessage": true,
+        "clear": false
+      },
+      "detail": "Clean and rebuild net_lwip_webserver with NCM for RW612"
+    },
+    {
+      "label": "Clean NCM build",
+      "type": "shell",
+      "command": "rm",
+      "args": [
+        "-rf",
+        "build"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}/examples/device/net_lwip_webserver"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "echo": true,
+        "reveal": "always",
+        "focus": false,
+        "panel": "shared",
+        "showReuseMessage": true,
+        "clear": false
+      },
+      "detail": "Remove build directory for clean rebuild"
+    },
+    {
+      "label": "Create build directory",
+      "type": "shell",
+      "command": "mkdir",
+      "args": [
+        "-p",
+        "build"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}/examples/device/net_lwip_webserver"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "echo": true,
+        "reveal": "silent",
+        "focus": false,
+        "panel": "shared",
+        "showReuseMessage": false,
+        "clear": false
+      },
+      "detail": "Create build directory if it doesn't exist"
+    },
+    {
+      "label": "Flash NCM to RW612 (JLink)",
+      "type": "shell",
+      "command": "ninja",
+      "args": [
+        "net_lwip_webserver-jlink"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}/examples/device/net_lwip_webserver/build"
+      },
+      "problemMatcher": [],
+      "group": "test",
+      "presentation": {
+        "echo": true,
+        "reveal": "always",
+        "focus": false,
+        "panel": "shared",
+        "showReuseMessage": true,
+        "clear": false
+      },
+      "detail": "Flash NCM firmware to RW612 using JLink"
+    },
+    {
+      "label": "Flash NCM to RW612 (OpenOCD)",
+      "type": "shell",
+      "command": "ninja",
+      "args": [
+        "net_lwip_webserver-openocd"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}/examples/device/net_lwip_webserver/build"
+      },
+      "problemMatcher": [],
+      "group": "test",
+      "presentation": {
+        "echo": true,
+        "reveal": "always",
+        "focus": false,
+        "panel": "shared",
+        "showReuseMessage": true,
+        "clear": false
+      },
+      "detail": "Flash NCM firmware to RW612 using OpenOCD"
+    }
+  ]
+}
