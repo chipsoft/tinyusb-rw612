@@ -2,17 +2,16 @@ UF2_FAMILY_ID = 0x2abc77ec
 JLINK_DEVICE = RW612
 JLINK_IF = swd
 
-# Use SDK from hw/mcu/nxp/mcux-sdk and lib/CMSIS_5
-SDK_DIR = $(TOP)/hw/mcu/nxp/mcux-sdk
-MCU_DIR = $(SDK_DIR)/devices/RW612
-SDK_DRIVERS = $(SDK_DIR)/drivers
-SDK_DEVICE = $(MCU_DIR)
-SDK_CMSIS = $(TOP)/lib/CMSIS_5/CMSIS/Core/Include
-SDK_STARTUP = $(MCU_DIR)
-SDK_UTILITIES = $(SDK_DIR)/components/uart
-SDK_UTILITIES_STR = $(SDK_DIR)/utilities/str
-SDK_COMPONENT = $(SDK_DIR)/components/uart
-SDK_COMPONENT_ELS = $(SDK_DIR)/components/els_pkc
+# Use SDK from parent project directory (../../)
+# This allows TinyUSB to use the same SDK as the main frdmrw612_freertos_hello project
+SDK_DEVICE = $(TOP)/../../device
+SDK_DRIVERS = $(TOP)/../../drivers
+SDK_CMSIS = $(TOP)/../../CMSIS
+SDK_STARTUP = $(SDK_DEVICE)
+SDK_UTILITIES = $(TOP)/../../component/uart_adapter
+SDK_UTILITIES_STR = $(TOP)/../../utilities
+SDK_COMPONENT = $(TOP)/../../component/uart_adapter
+SDK_COMPONENT_ELS = $(TOP)/../../component/els_pkc
 
 include $(TOP)/$(BOARD_PATH)/board.mk
 
@@ -36,18 +35,18 @@ LD_FILE ?= hw/bsp/rw612/boards/frdm_rw612/build_main.ld
 # TinyUSB: RW612 uses ChipIdea HS controller
 SRC_C += src/portable/chipidea/ci_hs/dcd_ci_hs.c
 
-# RW612 SDK drivers  
+# RW612 SDK drivers
 SRC_C += \
 	$(SDK_DEVICE)/system_RW612.c \
-	$(SDK_DEVICE)/drivers/fsl_clock.c \
-	$(SDK_DEVICE)/drivers/fsl_power.c \
-	$(SDK_DEVICE)/drivers/fsl_reset.c \
-	$(SDK_DEVICE)/drivers/fsl_ocotp.c \
-	$(SDK_DRIVERS)/lpc_gpio/fsl_gpio.c \
-	$(SDK_DRIVERS)/flexcomm/fsl_flexcomm.c \
-	$(SDK_DRIVERS)/flexcomm/usart/fsl_usart.c \
-	$(SDK_DRIVERS)/common/fsl_common.c \
-	$(SDK_DRIVERS)/common/fsl_common_arm.c
+	$(SDK_DRIVERS)/fsl_clock.c \
+	$(SDK_DRIVERS)/fsl_power.c \
+	$(SDK_DRIVERS)/fsl_reset.c \
+	$(SDK_DRIVERS)/fsl_ocotp.c \
+	$(SDK_DRIVERS)/fsl_gpio.c \
+	$(SDK_DRIVERS)/fsl_flexcomm.c \
+	$(SDK_DRIVERS)/fsl_usart.c \
+	$(SDK_DRIVERS)/fsl_common.c \
+	$(SDK_DRIVERS)/fsl_common_arm.c
 
 # Note: ELS/PKC crypto library disabled - missing platform headers
 # SRC_C += \
@@ -59,13 +58,8 @@ INC += \
 	$(SDK_CMSIS) \
 	$(TOP)/hw/bsp/rw612 \
 	$(SDK_DEVICE) \
-	$(SDK_DEVICE)/drivers \
-	$(SDK_DRIVERS)/lpc_gpio \
-	$(SDK_DRIVERS)/flexcomm \
-	$(SDK_DRIVERS)/flexcomm/usart \
-	$(SDK_DRIVERS)/common \
-	$(SDK_DRIVERS)/flexspi \
-	$(SDK_DRIVERS)/cache/cache64 \
+	$(SDK_DEVICE)/periph \
+	$(SDK_DRIVERS) \
 	$(SDK_UTILITIES) \
 	$(SDK_UTILITIES_STR) \
 	$(SDK_COMPONENT)
@@ -90,4 +84,4 @@ INC += \
 #	$(SDK_COMPONENT_ELS)/includes/platform/rw61x
 
 # Startup file (C-based startup for RW612)
-SRC_C += $(SDK_STARTUP)/mcuxpresso/startup_rw612.c
+SRC_C += $(TOP)/../../startup/startup_rw612.c
