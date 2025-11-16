@@ -166,10 +166,24 @@ static void init_lwip(void) {
 #if LWIP_NETIF_LINK_CALLBACK
   // Set the link callback to notify USB host about link state changes
   netif_set_link_callback(netif, usbnet_netif_link_callback);
-  netif_set_link_up(netif);
+  // DON'T set link up yet - wait for USB to be mounted first
+  // netif_set_link_up(netif);
 #else
-  tud_network_link_state(BOARD_TUD_RHPORT, true);
+  // DON'T notify link state yet - wait for USB to be mounted first
+  // tud_network_link_state(BOARD_TUD_RHPORT, true);
 #endif
+}
+
+// Invoked when device is mounted (configured by USB host)
+void tud_mount_cb(void) {
+  // Set link UP only after USB enumeration completes
+  netif_set_link_up(&netif_data);
+}
+
+// Invoked when device is unmounted
+void tud_umount_cb(void) {
+  // Set link DOWN when USB is disconnected
+  netif_set_link_down(&netif_data);
 }
 
 /* handle any DNS requests from dns-server */
