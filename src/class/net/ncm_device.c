@@ -107,6 +107,11 @@ typedef struct {
   } notification_xmit_state;                            // state of notification transmission
   bool notification_xmit_is_running;                    // notification is currently transmitted
   bool link_is_up;                                      // current link state
+  uint16_t packet_filter;                               // host packet filter selection
+  uint16_t ntb_format;                                  // 0 = NTH16/NDP16
+  uint32_t ntb_input_size;                              // requested host->device NTB size
+  uint16_t max_datagram_size;                           // requested max datagram size
+  uint16_t crc_mode;                                    // 0 = no CRC
 
   // misc
   bool tud_network_recv_renew_active;                   // tud_network_recv_renew() is active (avoid recursive invocations)
@@ -804,6 +809,11 @@ void netd_init(void) {
   #else
   ncm_interface.link_is_up = true; // Default to link up if not set.
   #endif
+  ncm_interface.packet_filter = 0;
+  ncm_interface.ntb_format = 0;
+  ncm_interface.ntb_input_size = CFG_TUD_NCM_OUT_NTB_MAX_SIZE;
+  ncm_interface.max_datagram_size = CFG_TUD_NET_MTU;
+  ncm_interface.crc_mode = 0;
 } // netd_init
 
 /**
@@ -918,6 +928,31 @@ bool netd_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t result, uint32_
  * At startup transmission of notification packets are done here.
  */
 bool netd_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t const *request) {
+  if (stage == CONTROL_STAGE_DATA) {
+    if (request->bmRequestType_bit.type == TUSB_REQ_TYPE_CLASS &&
+        request->bmRequestType_bit.direction == TUSB_DIR_OUT &&
+        ncm_interface.itf_num == request->wIndex) {
+      switch (request->bRequest) {
+        case NCM_SET_NTB_INPUT_SIZE:
+          if (ncm_interface.ntb_input_size < sizeof(nth16_t) + sizeof(ndp16_t) + 2 * sizeof(ndp16_datagram_t) ||
+              ncm_interface.ntb_input_size > CFG_TUD_NCM_OUT_NTB_MAX_SIZE) {
+            ncm_interface.ntb_input_size = CFG_TUD_NCM_OUT_NTB_MAX_SIZE;
+          }
+          break;
+
+        case NCM_SET_MAX_DATAGRAM_SIZE:
+          if (ncm_interface.max_datagram_size == 0 || ncm_interface.max_datagram_size > CFG_TUD_NET_MTU) {
+            ncm_interface.max_datagram_size = CFG_TUD_NET_MTU;
+          }
+          break;
+
+        default:
+          break;
+      }
+    }
+    return true;
+  }
+
   if (stage != CONTROL_STAGE_SETUP) {
     return true;
   }
@@ -953,12 +988,72 @@ bool netd_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t 
     case TUSB_REQ_TYPE_CLASS:
       TU_VERIFY(ncm_interface.itf_num == request->wIndex, false);
       switch (request->bRequest) {
+        case NCM_SET_ETHERNET_PACKET_FILTER: {
+          ncm_interface.packet_filter = request->wValue;
+          tud_control_status(rhport, request);
+
+          // Some hosts (including macOS) expect/benefit from a fresh
+          // NETWORK_CONNECTION notification after packet filter programming.
+          if (ncm_interface.link_is_up) {
+            ncm_interface.notification_xmit_state = NOTIFICATION_CONNECTED;
+            notification_xmit(rhport, false);
+          }
+        } break;
+
         case NCM_GET_NTB_PARAMETERS: {
-          // transfer NTB parameters to host.
+          // Transfer NTB parameters to host.
           tud_control_xfer(rhport, request, (void *) (uintptr_t) &ntb_parameters, sizeof(ntb_parameters));
         } break;
 
-          // unsupported request
+        case NCM_GET_NTB_FORMAT:
+          tud_control_xfer(rhport, request, (void *) (uintptr_t) &ncm_interface.ntb_format,
+                           sizeof(ncm_interface.ntb_format));
+          break;
+
+        case NCM_SET_NTB_FORMAT:
+          if (request->wLength != 0 || request->wValue != 0) {
+            return false;
+          }
+          ncm_interface.ntb_format = 0;
+          tud_control_status(rhport, request);
+          break;
+
+        case NCM_GET_NTB_INPUT_SIZE:
+          tud_control_xfer(rhport, request, (void *) (uintptr_t) &ncm_interface.ntb_input_size,
+                           sizeof(ncm_interface.ntb_input_size));
+          break;
+
+        case NCM_SET_NTB_INPUT_SIZE:
+          TU_VERIFY(request->wLength == sizeof(ncm_interface.ntb_input_size), false);
+          tud_control_xfer(rhport, request, (void *) (uintptr_t) &ncm_interface.ntb_input_size,
+                           sizeof(ncm_interface.ntb_input_size));
+          break;
+
+        case NCM_GET_MAX_DATAGRAM_SIZE:
+          tud_control_xfer(rhport, request, (void *) (uintptr_t) &ncm_interface.max_datagram_size,
+                           sizeof(ncm_interface.max_datagram_size));
+          break;
+
+        case NCM_SET_MAX_DATAGRAM_SIZE:
+          TU_VERIFY(request->wLength == sizeof(ncm_interface.max_datagram_size), false);
+          tud_control_xfer(rhport, request, (void *) (uintptr_t) &ncm_interface.max_datagram_size,
+                           sizeof(ncm_interface.max_datagram_size));
+          break;
+
+        case NCM_GET_CRC_MODE:
+          tud_control_xfer(rhport, request, (void *) (uintptr_t) &ncm_interface.crc_mode,
+                           sizeof(ncm_interface.crc_mode));
+          break;
+
+        case NCM_SET_CRC_MODE:
+          if (request->wLength != 0 || request->wValue > 1) {
+            return false;
+          }
+          ncm_interface.crc_mode = (uint16_t) request->wValue;
+          tud_control_status(rhport, request);
+          break;
+
+        // unsupported request
         default:
           return false;
       }
