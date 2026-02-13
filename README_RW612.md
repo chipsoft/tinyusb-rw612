@@ -1,5 +1,7 @@
 # TinyUSB Fork with RW612 Enhancements
 
+**Base Upstream Version:** TinyUSB 0.20.0
+
 This is a fork of [TinyUSB](https://github.com/hathach/tinyusb) with specific improvements for the NXP FRDM-RW612 board.
 
 ## Key Enhancement: NCM Support for Windows 10+
