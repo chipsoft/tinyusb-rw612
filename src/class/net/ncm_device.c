@@ -107,6 +107,8 @@ typedef struct {
   } notification_xmit_state;                            // state of notification transmission
   bool notification_xmit_is_running;                    // notification is currently transmitted
   bool link_is_up;                                      // current link state
+  uint8_t net_address[6];                               // host-visible network address
+  uint8_t class_request_data[512];                      // temporary buffer for optional class requests
   uint16_t packet_filter;                               // host packet filter selection
   uint16_t ntb_format;                                  // 0 = NTH16/NDP16
   uint32_t ntb_input_size;                              // requested host->device NTB size
@@ -809,6 +811,7 @@ void netd_init(void) {
   #else
   ncm_interface.link_is_up = true; // Default to link up if not set.
   #endif
+  memcpy(ncm_interface.net_address, tud_network_mac_address, sizeof(ncm_interface.net_address));
   ncm_interface.packet_filter = 0;
   ncm_interface.ntb_format = 0;
   ncm_interface.ntb_input_size = CFG_TUD_NCM_OUT_NTB_MAX_SIZE;
@@ -928,7 +931,19 @@ bool netd_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t result, uint32_
  * At startup transmission of notification packets are done here.
  */
 bool netd_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t const *request) {
+  if (stage == CONTROL_STAGE_SETUP) {
+    TU_LOG_DRV("NCM CTRL setup: type=%u dir=%u req=0x%02X wValue=0x%04X wIndex=0x%04X wLen=%u\n",
+               request->bmRequestType_bit.type,
+               request->bmRequestType_bit.direction,
+               request->bRequest,
+               request->wValue,
+               request->wIndex,
+               request->wLength);
+  }
+
   if (stage == CONTROL_STAGE_DATA) {
+    TU_LOG_DRV("NCM CTRL data: req=0x%02X wLen=%u\n", request->bRequest, request->wLength);
+
     if (request->bmRequestType_bit.type == TUSB_REQ_TYPE_CLASS &&
         request->bmRequestType_bit.direction == TUSB_DIR_OUT &&
         ncm_interface.itf_num == request->wIndex) {
@@ -1000,10 +1015,46 @@ bool netd_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t 
           }
         } break;
 
+        case NCM_SET_ETHERNET_MULTICAST_FILTERS:
+        case NCM_SET_ETHERNET_POWER_MANAGEMENT_PATTERN_FILTER: {
+          uint16_t xfer_len = request->wLength;
+          if (xfer_len > sizeof(ncm_interface.class_request_data)) {
+            xfer_len = sizeof(ncm_interface.class_request_data);
+          }
+
+          if (xfer_len > 0) {
+            tud_control_xfer(rhport, request, (void *) (uintptr_t) &ncm_interface.class_request_data, xfer_len);
+          } else {
+            tud_control_status(rhport, request);
+          }
+        } break;
+
+        case NCM_GET_ETHERNET_POWER_MANAGEMENT_PATTERN_FILTER:
+        case NCM_GET_ETHERNET_STATISTIC: {
+          uint16_t xfer_len = request->wLength;
+          if (xfer_len > sizeof(ncm_interface.class_request_data)) {
+            xfer_len = sizeof(ncm_interface.class_request_data);
+          }
+
+          tu_memclr(ncm_interface.class_request_data, xfer_len);
+          tud_control_xfer(rhport, request, (void *) (uintptr_t) &ncm_interface.class_request_data, xfer_len);
+        } break;
+
         case NCM_GET_NTB_PARAMETERS: {
           // Transfer NTB parameters to host.
           tud_control_xfer(rhport, request, (void *) (uintptr_t) &ntb_parameters, sizeof(ntb_parameters));
         } break;
+
+        case NCM_GET_NET_ADDRESS:
+          tud_control_xfer(rhport, request, (void *) (uintptr_t) &ncm_interface.net_address,
+                           sizeof(ncm_interface.net_address));
+          break;
+
+        case NCM_SET_NET_ADDRESS:
+          TU_VERIFY(request->wLength == sizeof(ncm_interface.net_address), false);
+          tud_control_xfer(rhport, request, (void *) (uintptr_t) &ncm_interface.net_address,
+                           sizeof(ncm_interface.net_address));
+          break;
 
         case NCM_GET_NTB_FORMAT:
           tud_control_xfer(rhport, request, (void *) (uintptr_t) &ncm_interface.ntb_format,
