@@ -110,6 +110,8 @@ typedef struct {
   uint8_t net_address[6];                               // host-visible network address
   uint8_t class_request_data[512];                      // temporary buffer for optional class requests
   uint16_t packet_filter;                               // host packet filter selection
+  uint8_t net_address[16];                              // host-visible network address blob
+  uint16_t net_address_len;                             // valid bytes in net_address
   uint16_t ntb_format;                                  // 0 = NTH16/NDP16
   uint32_t ntb_input_size;                              // requested host->device NTB size
   uint16_t max_datagram_size;                           // requested max datagram size
@@ -811,7 +813,8 @@ void netd_init(void) {
   #else
   ncm_interface.link_is_up = true; // Default to link up if not set.
   #endif
-  memcpy(ncm_interface.net_address, tud_network_mac_address, sizeof(ncm_interface.net_address));
+  memcpy(ncm_interface.net_address, tud_network_mac_address, sizeof(tud_network_mac_address));
+  ncm_interface.net_address_len = sizeof(tud_network_mac_address);
   ncm_interface.packet_filter = 0;
   ncm_interface.ntb_format = 0;
   ncm_interface.ntb_input_size = CFG_TUD_NCM_OUT_NTB_MAX_SIZE;
@@ -948,6 +951,12 @@ bool netd_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t 
         request->bmRequestType_bit.direction == TUSB_DIR_OUT &&
         ncm_interface.itf_num == request->wIndex) {
       switch (request->bRequest) {
+        case NCM_SET_NET_ADDRESS:
+          if (ncm_interface.net_address_len > sizeof(ncm_interface.net_address)) {
+            ncm_interface.net_address_len = sizeof(ncm_interface.net_address);
+          }
+          break;
+
         case NCM_SET_NTB_INPUT_SIZE:
           if (ncm_interface.ntb_input_size < sizeof(nth16_t) + sizeof(ndp16_t) + 2 * sizeof(ndp16_datagram_t) ||
               ncm_interface.ntb_input_size > CFG_TUD_NCM_OUT_NTB_MAX_SIZE) {
@@ -1046,14 +1055,15 @@ bool netd_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t 
         } break;
 
         case NCM_GET_NET_ADDRESS:
-          tud_control_xfer(rhport, request, (void *) (uintptr_t) &ncm_interface.net_address,
-                           sizeof(ncm_interface.net_address));
+          tud_control_xfer(rhport, request, (void *) (uintptr_t) ncm_interface.net_address,
+                           ncm_interface.net_address_len);
           break;
 
         case NCM_SET_NET_ADDRESS:
-          TU_VERIFY(request->wLength == sizeof(ncm_interface.net_address), false);
-          tud_control_xfer(rhport, request, (void *) (uintptr_t) &ncm_interface.net_address,
-                           sizeof(ncm_interface.net_address));
+          TU_VERIFY(request->wLength <= sizeof(ncm_interface.net_address), false);
+          ncm_interface.net_address_len = request->wLength;
+          tud_control_xfer(rhport, request, (void *) (uintptr_t) ncm_interface.net_address,
+                           ncm_interface.net_address_len);
           break;
 
         case NCM_GET_NTB_FORMAT:
