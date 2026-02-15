@@ -110,6 +110,7 @@ typedef struct {
   uint8_t net_address[6];                               // host-visible network address
   uint8_t class_request_data[512];                      // temporary buffer for optional class requests
   uint16_t packet_filter;                               // host packet filter selection
+  bool host_sent_datagram;                              // host has sent at least one data datagram
   uint8_t net_address[16];                              // host-visible network address blob
   uint16_t net_address_len;                             // valid bytes in net_address
   uint16_t ntb_format;                                  // 0 = NTH16/NDP16
@@ -181,6 +182,14 @@ TU_ATTR_ALIGNED(4) static const ntb_parameters_t ntb_parameters = {
 static void notification_xmit(uint8_t rhport, bool force_next) {
   TU_LOG_DRV("notification_xmit(%d, %d) - %d %d\n", force_next, rhport, ncm_interface.notification_xmit_state, ncm_interface.notification_xmit_is_running);
 
+  // Never attempt to queue a notification while endpoint is busy.
+  // usbd_edpt_xfer() asserts on busy endpoint.
+  if (usbd_edpt_busy(rhport, ncm_interface.ep_notif)) {
+    TU_LOG_DRV("  notification endpoint busy, defer\n");
+    ncm_interface.notification_xmit_is_running = true;
+    return;
+  }
+
   if (!force_next && ncm_interface.notification_xmit_is_running) {
     return;
   }
@@ -210,10 +219,14 @@ static void notification_xmit(uint8_t rhport, bool force_next) {
 
     uint16_t notif_len = sizeof(notify_speed_change.header) + notify_speed_change.header.wLength;
     ncm_epbuf.epnotif = notify_speed_change;
-    usbd_edpt_xfer(rhport, ncm_interface.ep_notif, (uint8_t*) &ncm_epbuf.epnotif, notif_len);
-
-    ncm_interface.notification_xmit_state = NOTIFICATION_CONNECTED;
-    ncm_interface.notification_xmit_is_running = true;
+    bool queued = usbd_edpt_xfer(rhport, ncm_interface.ep_notif, (uint8_t*) &ncm_epbuf.epnotif, notif_len);
+    if (queued) {
+      ncm_interface.notification_xmit_state = NOTIFICATION_CONNECTED;
+      ncm_interface.notification_xmit_is_running = true;
+    } else {
+      TU_LOG_DRV("(WW) notification speed xfer not queued, will retry\n");
+      ncm_interface.notification_xmit_is_running = false;
+    }
   } else if (ncm_interface.notification_xmit_state == NOTIFICATION_CONNECTED) {
     TU_LOG_DRV("  NOTIFICATION_CONNECTED\n");
     ncm_notify_t notify_connected = {
@@ -232,10 +245,14 @@ static void notification_xmit(uint8_t rhport, bool force_next) {
 
     uint16_t notif_len = sizeof(notify_connected.header) + notify_connected.header.wLength;
     ncm_epbuf.epnotif = notify_connected;
-    usbd_edpt_xfer(rhport, ncm_interface.ep_notif, (uint8_t *) &ncm_epbuf.epnotif, notif_len);
-
-    ncm_interface.notification_xmit_state = NOTIFICATION_DONE;
-    ncm_interface.notification_xmit_is_running = true;
+    bool queued = usbd_edpt_xfer(rhport, ncm_interface.ep_notif, (uint8_t *) &ncm_epbuf.epnotif, notif_len);
+    if (queued) {
+      ncm_interface.notification_xmit_state = NOTIFICATION_DONE;
+      ncm_interface.notification_xmit_is_running = true;
+    } else {
+      TU_LOG_DRV("(WW) notification connected xfer not queued, will retry\n");
+      ncm_interface.notification_xmit_is_running = false;
+    }
   } else {
     TU_LOG_DRV("  NOTIFICATION_FINISHED\n");
     ncm_interface.notification_xmit_is_running = false;
@@ -353,6 +370,10 @@ static void xmit_start_if_possible(uint8_t rhport) {
   }
   if (ncm_interface.itf_data_alt != 1) {
     TU_LOG_DRV("(EE) !xmit_start_if_possible 2\n");
+    return;
+  }
+  if (ncm_interface.packet_filter == 0 && !ncm_interface.host_sent_datagram) {
+    TU_LOG_DRV("  !xmit_start_if_possible host not configured (filter=0, no-rx)\n");
     return;
   }
   if (usbd_edpt_busy(rhport, ncm_interface.ep_in)) {
@@ -683,6 +704,16 @@ bool tud_network_can_xmit(uint16_t size) {
 
   TU_ASSERT(size <= CFG_TUD_NCM_IN_NTB_MAX_SIZE - (sizeof(nth16_t) + sizeof(ndp16_t) + 2 * sizeof(ndp16_datagram_t)), false);
 
+  // Do not queue payload frames until host enables data interface and programs
+  // packet filter (or at least starts sending us data). Some macOS versions
+  // do not always program packet filter before data traffic.
+  if (ncm_interface.itf_data_alt != 1 ||
+      (ncm_interface.packet_filter == 0 && !ncm_interface.host_sent_datagram)) {
+    TU_LOG_DRV("  !tud_network_can_xmit host not configured (alt=%u, filter=0x%04x, host_rx=%u)\n",
+               ncm_interface.itf_data_alt, ncm_interface.packet_filter, ncm_interface.host_sent_datagram);
+    return false;
+  }
+
   if (xmit_requested_datagram_fits_into_current_ntb(size) || xmit_setup_next_glue_ntb()) {
     // -> everything is fine
     return true;
@@ -768,24 +799,37 @@ static void tud_network_recv_renew_r(uint8_t rhport) {
 void tud_network_link_state(uint8_t rhport, bool is_up) {
   TU_LOG_DRV("tud_network_link_state(%d, %d)\n", rhport, is_up);
 
-  if (ncm_interface.link_is_up == is_up) {
-    // No change in link state
-    return;
-  }
-
+  bool link_changed = (ncm_interface.link_is_up != is_up);
   ncm_interface.link_is_up = is_up;
 
-  // Only send notification if we have an active data interface
-  if (ncm_interface.itf_data_alt != 1) {
-    TU_LOG_DRV("  link state notification skipped (interface not active)\n");
+  // On state transition always push fresh connection notification.
+  if (link_changed) {
+    ncm_interface.notification_xmit_state = NOTIFICATION_CONNECTED;
+  } else if (is_up && (ncm_interface.itf_data_alt != 1 || ncm_interface.packet_filter == 0)) {
+    // Link state unchanged but host did not fully configure NCM yet.
+    // Keep trying NETWORK_CONNECTION notifications to recover host races.
+    ncm_interface.notification_xmit_state = NOTIFICATION_CONNECTED;
+  } else if (ncm_interface.notification_xmit_state == NOTIFICATION_DONE) {
     return;
   }
 
-  // Reset notification state to send link state update
-  ncm_interface.notification_xmit_state = NOTIFICATION_CONNECTED;
+  // Notifications are meaningful only when data interface is active.
+  if (ncm_interface.itf_data_alt != 1) {
+    TU_LOG_DRV("  link state notification deferred (interface not active)\n");
+    return;
+  }
 
   // Trigger notification transmission
   notification_xmit(rhport, false);
+}
+
+bool tud_network_ncm_data_interface_active(void) {
+  return ncm_interface.itf_data_alt == 1;
+}
+
+bool tud_network_ncm_host_configured(void) {
+  return (ncm_interface.itf_data_alt == 1) &&
+         (ncm_interface.packet_filter != 0 || ncm_interface.host_sent_datagram);
 }
 
 //-----------------------------------------------------------------------------
@@ -816,6 +860,7 @@ void netd_init(void) {
   memcpy(ncm_interface.net_address, tud_network_mac_address, sizeof(tud_network_mac_address));
   ncm_interface.net_address_len = sizeof(tud_network_mac_address);
   ncm_interface.packet_filter = 0;
+  ncm_interface.host_sent_datagram = false;
   ncm_interface.ntb_format = 0;
   ncm_interface.ntb_input_size = CFG_TUD_NCM_OUT_NTB_MAX_SIZE;
   ncm_interface.max_datagram_size = CFG_TUD_NET_MTU;
@@ -907,6 +952,7 @@ bool netd_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t result, uint32_
       recv_put_ntb_into_free_list(ncm_interface.recv_tinyusb_ntb);
     } else {
       // packet ok -> put it into ready list
+      ncm_interface.host_sent_datagram = true;
       recv_put_ntb_into_ready_list(ncm_interface.recv_tinyusb_ntb);
     }
     ncm_interface.recv_tinyusb_ntb = NULL;
@@ -998,7 +1044,13 @@ bool netd_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t 
 
           if (ncm_interface.itf_data_alt == 1) {
             tud_network_recv_renew_r(rhport);
+            // Restart full notification sequence when host activates data interface.
+            // This avoids "inactive media" on hosts that missed an earlier notification.
+            ncm_interface.notification_xmit_state = NOTIFICATION_SPEED;
             notification_xmit(rhport, false);
+          } else {
+            ncm_interface.notification_xmit_is_running = false;
+            ncm_interface.host_sent_datagram = false;
           }
           tud_control_status(rhport, request);
         } break;
@@ -1010,7 +1062,10 @@ bool netd_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t 
       break;
 
     case TUSB_REQ_TYPE_CLASS:
-      TU_VERIFY(ncm_interface.itf_num == request->wIndex, false);
+      // Be permissive: some hosts may issue NCM class requests using either the
+      // control interface index or the associated data interface index.
+      TU_VERIFY((request->wIndex == ncm_interface.itf_num) ||
+                (request->wIndex == (uint16_t) (ncm_interface.itf_num + 1)), false);
       switch (request->bRequest) {
         case NCM_SET_ETHERNET_PACKET_FILTER: {
           ncm_interface.packet_filter = request->wValue;
@@ -1022,6 +1077,9 @@ bool netd_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t 
             ncm_interface.notification_xmit_state = NOTIFICATION_CONNECTED;
             notification_xmit(rhport, false);
           }
+
+          // Host is now ready to receive payload traffic.
+          xmit_start_if_possible(rhport);
         } break;
 
         case NCM_SET_ETHERNET_MULTICAST_FILTERS:
