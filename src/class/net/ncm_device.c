@@ -109,7 +109,6 @@ typedef struct {
   } notification_xmit_state;                            // state of notification transmission
   bool notification_xmit_is_running;                    // notification is currently transmitted
   bool link_is_up;                                      // current link state
-  uint8_t net_address[6];                               // host-visible network address
   uint8_t class_request_data[512];                      // temporary buffer for optional class requests
   uint16_t packet_filter;                               // host packet filter selection
   bool host_sent_datagram;                              // host has sent at least one data datagram
