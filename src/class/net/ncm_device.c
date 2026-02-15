@@ -200,7 +200,9 @@ static void notification_xmit(uint8_t rhport, bool force_next) {
   // usbd_edpt_xfer() asserts on busy endpoint.
   if (usbd_edpt_busy(rhport, ncm_interface.ep_notif)) {
     TU_LOG_DRV("  notification endpoint busy, defer\n");
-    ncm_interface.notification_xmit_is_running = true;
+    // Keep "running" false here: no transfer was queued.
+    // Otherwise future non-force retries can be blocked forever.
+    ncm_interface.notification_xmit_is_running = false;
     return;
   }
 
