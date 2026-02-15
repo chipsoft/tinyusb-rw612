@@ -62,6 +62,7 @@
 #endif
 
 #define TU_LOG_DRV(...)   TU_LOG(CFG_TUD_NCM_LOG_LEVEL, __VA_ARGS__)
+#define NCM_HOST_CONFIG_GRACE_BLOCKED_TRIES 20u
 
 // Alignment must be 4
 #define TUD_NCM_ALIGNMENT   4
@@ -83,6 +84,7 @@ typedef struct {
   uint8_t itf_num;      // interface number
   uint8_t itf_data_alt; // ==0 -> no endpoints, i.e. no network traffic, ==1 -> normal operation with two endpoints (spec, chapter 5.3)
   uint8_t rhport;       // storage of \a rhport because some callbacks are done without it
+  uint16_t host_config_blocked_tries;                     // count blocked TX tries while host setup is incomplete
 
   // recv handling
   recv_ntb_t *recv_free_ntb[RECV_NTB_N];                // free list of recv NTBs
@@ -137,6 +139,18 @@ typedef struct {
 
 static ncm_interface_t ncm_interface;
 CFG_TUD_MEM_SECTION static ncm_epbuf_t ncm_epbuf;
+
+static bool ncm_host_configured_for_tx(void) {
+  if (ncm_interface.itf_data_alt != 1) {
+    return false;
+  }
+
+  if (ncm_interface.packet_filter != 0 || ncm_interface.host_sent_datagram) {
+    return true;
+  }
+
+  return ncm_interface.host_config_blocked_tries >= NCM_HOST_CONFIG_GRACE_BLOCKED_TRIES;
+}
 
 /**
  * This is the NTB parameter structure
@@ -372,8 +386,9 @@ static void xmit_start_if_possible(uint8_t rhport) {
     TU_LOG_DRV("(EE) !xmit_start_if_possible 2\n");
     return;
   }
-  if (ncm_interface.packet_filter == 0 && !ncm_interface.host_sent_datagram) {
-    TU_LOG_DRV("  !xmit_start_if_possible host not configured (filter=0, no-rx)\n");
+  if (!ncm_host_configured_for_tx()) {
+    TU_LOG_DRV("  !xmit_start_if_possible host not configured (filter=0x%04x, host_rx=%u)\n",
+               ncm_interface.packet_filter, ncm_interface.host_sent_datagram);
     return;
   }
   if (usbd_edpt_busy(rhport, ncm_interface.ep_in)) {
@@ -707,10 +722,15 @@ bool tud_network_can_xmit(uint16_t size) {
   // Do not queue payload frames until host enables data interface and programs
   // packet filter (or at least starts sending us data). Some macOS versions
   // do not always program packet filter before data traffic.
-  if (ncm_interface.itf_data_alt != 1 ||
-      (ncm_interface.packet_filter == 0 && !ncm_interface.host_sent_datagram)) {
+  if (!ncm_host_configured_for_tx()) {
     TU_LOG_DRV("  !tud_network_can_xmit host not configured (alt=%u, filter=0x%04x, host_rx=%u)\n",
                ncm_interface.itf_data_alt, ncm_interface.packet_filter, ncm_interface.host_sent_datagram);
+    if (ncm_interface.itf_data_alt == 1 &&
+        ncm_interface.packet_filter == 0 &&
+        !ncm_interface.host_sent_datagram &&
+        ncm_interface.host_config_blocked_tries < NCM_HOST_CONFIG_GRACE_BLOCKED_TRIES) {
+      ncm_interface.host_config_blocked_tries++;
+    }
     return false;
   }
 
@@ -828,8 +848,7 @@ bool tud_network_ncm_data_interface_active(void) {
 }
 
 bool tud_network_ncm_host_configured(void) {
-  return (ncm_interface.itf_data_alt == 1) &&
-         (ncm_interface.packet_filter != 0 || ncm_interface.host_sent_datagram);
+  return ncm_host_configured_for_tx();
 }
 
 //-----------------------------------------------------------------------------
@@ -861,6 +880,7 @@ void netd_init(void) {
   ncm_interface.net_address_len = sizeof(tud_network_mac_address);
   ncm_interface.packet_filter = 0;
   ncm_interface.host_sent_datagram = false;
+  ncm_interface.host_config_blocked_tries = 0;
   ncm_interface.ntb_format = 0;
   ncm_interface.ntb_input_size = CFG_TUD_NCM_OUT_NTB_MAX_SIZE;
   ncm_interface.max_datagram_size = CFG_TUD_NET_MTU;
@@ -1043,6 +1063,7 @@ bool netd_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t 
           ncm_interface.itf_data_alt = (uint8_t) request->wValue;
 
           if (ncm_interface.itf_data_alt == 1) {
+            ncm_interface.host_config_blocked_tries = 0;
             tud_network_recv_renew_r(rhport);
             // Restart full notification sequence when host activates data interface.
             // This avoids "inactive media" on hosts that missed an earlier notification.
@@ -1051,6 +1072,7 @@ bool netd_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t 
           } else {
             ncm_interface.notification_xmit_is_running = false;
             ncm_interface.host_sent_datagram = false;
+            ncm_interface.host_config_blocked_tries = 0;
           }
           tud_control_status(rhport, request);
         } break;
