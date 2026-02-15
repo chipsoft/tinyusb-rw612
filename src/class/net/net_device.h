@@ -105,6 +105,9 @@ bool tud_network_ncm_data_interface_active(void);
 // Returns true if host configured NCM data path (alt setting active + packet filter programmed)
 bool tud_network_ncm_host_configured(void);
 
+// Returns true only when host strictly configured NCM data path (no grace fallback)
+bool tud_network_ncm_host_strictly_configured(void);
+
 //--------------------------------------------------------------------+
 // INTERNAL USBD-CLASS DRIVER API
 //--------------------------------------------------------------------+

@@ -140,12 +140,13 @@ static ncm_interface_t ncm_interface;
 CFG_TUD_MEM_SECTION static ncm_epbuf_t ncm_epbuf;
 static void recv_put_ntb_into_free_list(recv_ntb_t *free_ntb);
 
-static bool ncm_host_configured_for_tx(void) {
-  if (ncm_interface.itf_data_alt != 1) {
-    return false;
-  }
+static bool ncm_host_strictly_configured_for_tx(void) {
+  return (ncm_interface.itf_data_alt == 1) &&
+         (ncm_interface.packet_filter != 0 || ncm_interface.host_sent_datagram);
+}
 
-  if (ncm_interface.packet_filter != 0 || ncm_interface.host_sent_datagram) {
+static bool ncm_host_configured_for_tx(void) {
+  if (ncm_host_strictly_configured_for_tx()) {
     return true;
   }
 
@@ -893,6 +894,10 @@ bool tud_network_ncm_data_interface_active(void) {
 
 bool tud_network_ncm_host_configured(void) {
   return ncm_host_configured_for_tx();
+}
+
+bool tud_network_ncm_host_strictly_configured(void) {
+  return ncm_host_strictly_configured_for_tx();
 }
 
 //-----------------------------------------------------------------------------
