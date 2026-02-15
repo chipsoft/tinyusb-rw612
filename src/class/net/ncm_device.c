@@ -138,6 +138,7 @@ typedef struct {
 
 static ncm_interface_t ncm_interface;
 CFG_TUD_MEM_SECTION static ncm_epbuf_t ncm_epbuf;
+static void recv_put_ntb_into_free_list(recv_ntb_t *free_ntb);
 
 static bool ncm_host_configured_for_tx(void) {
   if (ncm_interface.itf_data_alt != 1) {
@@ -341,6 +342,48 @@ static xmit_ntb_t *xmit_get_next_ready_ntb(void) {
   TU_LOG_DRV("recv_get_next_ready_ntb: %p\n", r);
   return r;
 } // xmit_get_next_ready_ntb
+
+/**
+ * Flush buffered TX/RX NTBs after host data-interface alt-setting changes.
+ * This prevents stale in-flight state from blocking traffic after alt flaps.
+ */
+static void ncm_flush_data_paths(void) {
+  if (ncm_interface.xmit_tinyusb_ntb != NULL) {
+    xmit_put_ntb_into_free_list(ncm_interface.xmit_tinyusb_ntb);
+    ncm_interface.xmit_tinyusb_ntb = NULL;
+  }
+
+  if (ncm_interface.xmit_glue_ntb != NULL) {
+    xmit_put_ntb_into_free_list(ncm_interface.xmit_glue_ntb);
+    ncm_interface.xmit_glue_ntb = NULL;
+  }
+  ncm_interface.xmit_glue_ntb_datagram_ndx = 0;
+
+  for (int i = 0; i < XMIT_NTB_N; ++i) {
+    if (ncm_interface.xmit_ready_ntb[i] != NULL) {
+      xmit_put_ntb_into_free_list(ncm_interface.xmit_ready_ntb[i]);
+      ncm_interface.xmit_ready_ntb[i] = NULL;
+    }
+  }
+
+  if (ncm_interface.recv_tinyusb_ntb != NULL) {
+    recv_put_ntb_into_free_list(ncm_interface.recv_tinyusb_ntb);
+    ncm_interface.recv_tinyusb_ntb = NULL;
+  }
+
+  if (ncm_interface.recv_glue_ntb != NULL) {
+    recv_put_ntb_into_free_list(ncm_interface.recv_glue_ntb);
+    ncm_interface.recv_glue_ntb = NULL;
+  }
+  ncm_interface.recv_glue_ntb_datagram_ndx = 0;
+
+  for (int i = 0; i < RECV_NTB_N; ++i) {
+    if (ncm_interface.recv_ready_ntb[i] != NULL) {
+      recv_put_ntb_into_free_list(ncm_interface.recv_ready_ntb[i]);
+      ncm_interface.recv_ready_ntb[i] = NULL;
+    }
+  }
+}
 
 /**
  * Transmit a ZLP if required
@@ -1059,7 +1102,11 @@ bool netd_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t 
         case TUSB_REQ_SET_INTERFACE: {
           TU_VERIFY(ncm_interface.itf_num + 1 == request->wIndex && request->wValue < 2, false);
 
+          uint8_t prev_alt = ncm_interface.itf_data_alt;
           ncm_interface.itf_data_alt = (uint8_t) request->wValue;
+          if (prev_alt != ncm_interface.itf_data_alt) {
+            ncm_flush_data_paths();
+          }
 
           if (ncm_interface.itf_data_alt == 1) {
             ncm_interface.host_config_blocked_tries = 0;
