@@ -553,7 +553,15 @@ TU_ATTR_ALWAYS_INLINE static inline uint8_t tu_edpt_addr(uint8_t num, uint8_t di
 }
 
 TU_ATTR_ALWAYS_INLINE static inline uint16_t tu_edpt_packet_size(tusb_desc_endpoint_t const* desc_ep) {
-  return tu_le16toh(desc_ep->wMaxPacketSize) & 0x7FF;
+  /* USB configuration descriptors are walked byte-by-byte, so `desc_ep` can
+   * land on an odd address.  With ARMv8-M MPU/secure checker policies that
+   * split attribution at halfword granularity, a single unaligned `LDRH` on
+   * `wMaxPacketSize` can fault even though `CCR.UNALIGN_TRP == 0`.  Force a
+   * byte-wise read through a volatile `uint8_t*` so the compiler cannot
+   * emit a halfword load regardless of `-munaligned-access`. */
+  volatile uint8_t const *p = (volatile uint8_t const *)desc_ep + 4;  /* offsetof(wMaxPacketSize) */
+  uint16_t raw = (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
+  return tu_le16toh(raw) & 0x7FF;
 }
 
 #if CFG_TUSB_DEBUG
