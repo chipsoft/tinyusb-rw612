@@ -495,17 +495,19 @@ static bool xmit_setup_next_glue_ntb(void) {
     xmit_put_ntb_into_ready_list(ncm_interface.xmit_glue_ntb);
   }
 
-  ncm_interface.xmit_glue_ntb = xmit_get_free_ntb();// get next buffer (if any)
-  if (ncm_interface.xmit_glue_ntb == NULL) {
+  // Capture into local: a concurrent SET_INTERFACE or DMA-done callback can
+  // zero ncm_interface.xmit_glue_ntb between a NULL check and the next read.
+  // Using a local guarantees the pointer we check is the pointer we dereference.
+  xmit_ntb_t *ntb = xmit_get_free_ntb();
+  if (ntb == NULL) {
     TU_LOG_DRV("  xmit_setup_next_glue_ntb - nothing free\n");// should happen rarely
+    ncm_interface.xmit_glue_ntb = NULL;
     return false;
   }
 
   ncm_interface.xmit_glue_ntb_datagram_ndx = 0;
 
-  xmit_ntb_t *ntb = ncm_interface.xmit_glue_ntb;
-
-  // Fill in NTB header
+  // Fill in NTB header via local — no re-read of the global
   ntb->nth.dwSignature = NTH16_SIGNATURE;
   ntb->nth.wHeaderLength = sizeof(ntb->nth);
   ntb->nth.wSequence = ncm_interface.xmit_sequence++;
@@ -518,6 +520,9 @@ static bool xmit_setup_next_glue_ntb(void) {
   ntb->ndp.wNextNdpIndex = 0;
 
   memset(ntb->ndp_datagram, 0, sizeof(ntb->ndp_datagram));
+
+  // Publish to global only after NTB is fully initialised
+  ncm_interface.xmit_glue_ntb = ntb;
   return true;
 } // xmit_setup_next_glue_ntb
 
@@ -795,12 +800,13 @@ bool tud_network_can_xmit(uint16_t size) {
 void tud_network_xmit(void *ref, uint16_t arg) {
   TU_LOG_DRV("tud_network_xmit(%p, %d)\n", ref, arg);
 
-  if (ncm_interface.xmit_glue_ntb == NULL) {
+  // Capture into local to avoid re-reading the global after the NULL check
+  // (a concurrent SET_INTERFACE can zero xmit_glue_ntb between the two reads).
+  xmit_ntb_t *ntb = ncm_interface.xmit_glue_ntb;
+  if (ntb == NULL) {
     TU_LOG_DRV("(EE) tud_network_xmit: no buffer\n");// must not happen (really)
     return;
   }
-
-  xmit_ntb_t *ntb = ncm_interface.xmit_glue_ntb;
 
   // copy new datagram to the end of the current NTB
   uint16_t size = tud_network_xmit_cb(ntb->data + ntb->nth.wBlockLength, ref, arg);
