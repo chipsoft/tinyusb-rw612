@@ -138,6 +138,10 @@ typedef struct {
 
 static ncm_interface_t ncm_interface;
 CFG_TUD_MEM_SECTION static ncm_epbuf_t ncm_epbuf;
+// Protects concurrent access to xmit_glue_ntb / xmit_glue_ntb_datagram_ndx
+// between the lwIP task (tud_network_can_xmit / tud_network_xmit) and the
+// USB task (tud_task → ncm_flush_data_paths / xmit_start_if_possible).
+static osal_spinlock_t s_xmit_glue_lock;
 static void recv_put_ntb_into_free_list(recv_ntb_t *free_ntb);
 
 static bool ncm_host_strictly_configured_for_tx(void) {
@@ -356,11 +360,13 @@ static void ncm_flush_data_paths(void) {
     ncm_interface.xmit_tinyusb_ntb = NULL;
   }
 
+  osal_spin_lock(&s_xmit_glue_lock, false);
   if (ncm_interface.xmit_glue_ntb != NULL) {
     xmit_put_ntb_into_free_list(ncm_interface.xmit_glue_ntb);
     ncm_interface.xmit_glue_ntb = NULL;
   }
   ncm_interface.xmit_glue_ntb_datagram_ndx = 0;
+  osal_spin_unlock(&s_xmit_glue_lock, false);
 
   for (int i = 0; i < XMIT_NTB_N; ++i) {
     if (ncm_interface.xmit_ready_ntb[i] != NULL) {
@@ -443,12 +449,17 @@ static void xmit_start_if_possible(uint8_t rhport) {
 
   ncm_interface.xmit_tinyusb_ntb = xmit_get_next_ready_ntb();
   if (ncm_interface.xmit_tinyusb_ntb == NULL) {
+    // Guard and steal of xmit_glue_ntb must be atomic with respect to the
+    // lwIP task that publishes / reads xmit_glue_ntb and datagram_ndx.
+    osal_spin_lock(&s_xmit_glue_lock, false);
     if (ncm_interface.xmit_glue_ntb == NULL || ncm_interface.xmit_glue_ntb_datagram_ndx == 0) {
       // -> really nothing is waiting
+      osal_spin_unlock(&s_xmit_glue_lock, false);
       return;
     }
     ncm_interface.xmit_tinyusb_ntb = ncm_interface.xmit_glue_ntb;
     ncm_interface.xmit_glue_ntb = NULL;
+    osal_spin_unlock(&s_xmit_glue_lock, false);
   }
 
   #if CFG_TUD_NCM_LOG_LEVEL >= 3
@@ -490,34 +501,44 @@ static bool xmit_requested_datagram_fits_into_current_ntb(uint16_t datagram_size
 static bool xmit_setup_next_glue_ntb(void) {
   TU_LOG_DRV("xmit_setup_next_glue_ntb - %p\n", ncm_interface.xmit_glue_ntb);
 
-  if (ncm_interface.xmit_glue_ntb != NULL) {
+  // Snapshot and clear the old glue NTB under lock so the USB task cannot
+  // race on xmit_glue_ntb while we decide what to do with the old buffer.
+  osal_spin_lock(&s_xmit_glue_lock, false);
+  xmit_ntb_t *old_ntb = ncm_interface.xmit_glue_ntb;
+  ncm_interface.xmit_glue_ntb = NULL;
+  osal_spin_unlock(&s_xmit_glue_lock, false);
+
+  if (old_ntb != NULL) {
     // put NTB into waiting list (the new datagram did not fit in)
-    xmit_put_ntb_into_ready_list(ncm_interface.xmit_glue_ntb);
+    xmit_put_ntb_into_ready_list(old_ntb);
   }
 
-  ncm_interface.xmit_glue_ntb = xmit_get_free_ntb();// get next buffer (if any)
-  if (ncm_interface.xmit_glue_ntb == NULL) {
+  // Allocate next free NTB — non-blocking array scan, no lock needed here.
+  xmit_ntb_t *ntb = xmit_get_free_ntb();
+  if (ntb == NULL) {
     TU_LOG_DRV("  xmit_setup_next_glue_ntb - nothing free\n");// should happen rarely
     return false;
   }
 
-  ncm_interface.xmit_glue_ntb_datagram_ndx = 0;
-
-  xmit_ntb_t *ntb = ncm_interface.xmit_glue_ntb;
-
-  // Fill in NTB header
+  // Fill in NTB and NDP16 headers via local variable — no shared-state access.
   ntb->nth.dwSignature = NTH16_SIGNATURE;
   ntb->nth.wHeaderLength = sizeof(ntb->nth);
   ntb->nth.wSequence = ncm_interface.xmit_sequence++;
   ntb->nth.wBlockLength = sizeof(ntb->nth) + sizeof(ntb->ndp) + sizeof(ntb->ndp_datagram);
   ntb->nth.wNdpIndex = sizeof(ntb->nth);
 
-  // Fill in NDP16 header and terminator
   ntb->ndp.dwSignature = NDP16_SIGNATURE_NCM0;
   ntb->ndp.wLength = sizeof(ntb->ndp) + sizeof(ntb->ndp_datagram);
   ntb->ndp.wNextNdpIndex = 0;
 
   memset(ntb->ndp_datagram, 0, sizeof(ntb->ndp_datagram));
+
+  // Publish: set datagram_ndx and xmit_glue_ntb together under lock so the
+  // USB task always sees a consistent (ptr, ndx) pair.
+  osal_spin_lock(&s_xmit_glue_lock, false);
+  ncm_interface.xmit_glue_ntb_datagram_ndx = 0;
+  ncm_interface.xmit_glue_ntb = ntb;
+  osal_spin_unlock(&s_xmit_glue_lock, false);
   return true;
 } // xmit_setup_next_glue_ntb
 
@@ -795,20 +816,26 @@ bool tud_network_can_xmit(uint16_t size) {
 void tud_network_xmit(void *ref, uint16_t arg) {
   TU_LOG_DRV("tud_network_xmit(%p, %d)\n", ref, arg);
 
-  if (ncm_interface.xmit_glue_ntb == NULL) {
+  // Snapshot xmit_glue_ntb and reserve the datagram slot atomically so that
+  // a concurrent SET_INTERFACE (ncm_flush_data_paths) cannot zero the pointer
+  // or re-use the slot between our NULL check and our NTB write.
+  osal_spin_lock(&s_xmit_glue_lock, false);
+  xmit_ntb_t *ntb = ncm_interface.xmit_glue_ntb;
+  if (ntb == NULL) {
+    osal_spin_unlock(&s_xmit_glue_lock, false);
     TU_LOG_DRV("(EE) tud_network_xmit: no buffer\n");// must not happen (really)
     return;
   }
+  uint16_t ndx = ncm_interface.xmit_glue_ntb_datagram_ndx;
+  ncm_interface.xmit_glue_ntb_datagram_ndx = (uint16_t)(ndx + 1);
+  osal_spin_unlock(&s_xmit_glue_lock, false);
 
-  xmit_ntb_t *ntb = ncm_interface.xmit_glue_ntb;
-
-  // copy new datagram to the end of the current NTB
+  // copy new datagram to the end of the current NTB (ntb and ndx exclusively ours)
   uint16_t size = tud_network_xmit_cb(ntb->data + ntb->nth.wBlockLength, ref, arg);
 
-  // correct NTB internals
-  ntb->ndp_datagram[ncm_interface.xmit_glue_ntb_datagram_ndx].wDatagramIndex = ntb->nth.wBlockLength;
-  ntb->ndp_datagram[ncm_interface.xmit_glue_ntb_datagram_ndx].wDatagramLength = size;
-  ncm_interface.xmit_glue_ntb_datagram_ndx += 1;
+  // correct NTB internals using captured slot index
+  ntb->ndp_datagram[ndx].wDatagramIndex = ntb->nth.wBlockLength;
+  ntb->ndp_datagram[ndx].wDatagramLength = size;
 
   ntb->nth.wBlockLength += (uint16_t) (size + XMIT_ALIGN_OFFSET(size));
 
