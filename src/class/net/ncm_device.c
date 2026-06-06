@@ -56,6 +56,9 @@
 #include "ncm.h"
 #include "net_device.h"
 
+#include "FreeRTOS.h"
+#include "task.h"
+
 // Level where CFG_TUSB_DEBUG must be at least for this driver is logged
 #ifndef CFG_TUD_NCM_LOG_LEVEL
   #define CFG_TUD_NCM_LOG_LEVEL   CFG_TUD_LOG_LEVEL
@@ -142,6 +145,9 @@ CFG_TUD_MEM_SECTION static ncm_epbuf_t ncm_epbuf;
 // between the lwIP task (tud_network_can_xmit / tud_network_xmit) and the
 // USB task (tud_task → ncm_flush_data_paths / xmit_start_if_possible).
 static osal_spinlock_t s_xmit_glue_lock;
+static TickType_t s_xmit_inflight_since_tick;
+static TickType_t s_xmit_stall_reported_for_start;
+static uint32_t s_xmit_stall_count;
 static void recv_put_ntb_into_free_list(recv_ntb_t *free_ntb);
 
 static bool ncm_host_strictly_configured_for_tx(void) {
@@ -355,6 +361,9 @@ static xmit_ntb_t *xmit_get_next_ready_ntb(void) {
  * This prevents stale in-flight state from blocking traffic after alt flaps.
  */
 static void ncm_flush_data_paths(void) {
+  s_xmit_inflight_since_tick = 0;
+  s_xmit_stall_reported_for_start = 0;
+
   if (ncm_interface.xmit_tinyusb_ntb != NULL) {
     xmit_put_ntb_into_free_list(ncm_interface.xmit_tinyusb_ntb);
     ncm_interface.xmit_tinyusb_ntb = NULL;
@@ -473,8 +482,23 @@ static void xmit_start_if_possible(uint8_t rhport) {
     TU_LOG_DRV(">> %d %d\n", ncm_interface.xmit_tinyusb_ntb->nth.wBlockLength, ncm_interface.xmit_glue_ntb_datagram_ndx);
   }
 
-  // Kick off an endpoint transfer
-  usbd_edpt_xfer(0, ncm_interface.ep_in, ncm_interface.xmit_tinyusb_ntb->data, ncm_interface.xmit_tinyusb_ntb->nth.wBlockLength);
+  // Kick off an endpoint transfer. If the DCD refuses the transfer even
+  // though usbd_edpt_busy() was false, do not leave the NTB owned by the
+  // TinyUSB in-flight slot forever. Requeue it so a later SOF/callback can
+  // retry and so tud_network_can_xmit() does not wedge permanently.
+  if (usbd_edpt_xfer(rhport,
+                     ncm_interface.ep_in,
+                     ncm_interface.xmit_tinyusb_ntb->data,
+                     ncm_interface.xmit_tinyusb_ntb->nth.wBlockLength)) {
+    s_xmit_inflight_since_tick = xTaskGetTickCount();
+    s_xmit_stall_reported_for_start = 0;
+  } else {
+    TU_LOG_DRV("(EE) xmit_start_if_possible: usbd_edpt_xfer failed\n");
+    xmit_put_ntb_into_ready_list(ncm_interface.xmit_tinyusb_ntb);
+    ncm_interface.xmit_tinyusb_ntb = NULL;
+    s_xmit_inflight_since_tick = 0;
+    s_xmit_stall_reported_for_start = 0;
+  }
 } // xmit_start_if_possible
 
 /**
@@ -927,6 +951,31 @@ bool tud_network_ncm_host_strictly_configured(void) {
   return ncm_host_strictly_configured_for_tx();
 }
 
+bool tud_network_ncm_tx_stalled(uint32_t timeout_ms) {
+  if (ncm_interface.xmit_tinyusb_ntb == NULL || s_xmit_inflight_since_tick == 0) {
+    return false;
+  }
+
+  TickType_t const now = xTaskGetTickCount();
+  uint32_t const age_ms = (uint32_t) pdTICKS_TO_MS(now - s_xmit_inflight_since_tick);
+  if (age_ms < timeout_ms) {
+    return false;
+  }
+
+  if (s_xmit_stall_reported_for_start != s_xmit_inflight_since_tick) {
+    s_xmit_stall_reported_for_start = s_xmit_inflight_since_tick;
+    s_xmit_stall_count++;
+    TU_LOG1("NCM TX in-flight stall #%lu: age=%lu ms ep=0x%02X ntb=%p len=%u\r\n",
+            (unsigned long) s_xmit_stall_count,
+            (unsigned long) age_ms,
+            ncm_interface.ep_in,
+            ncm_interface.xmit_tinyusb_ntb,
+            ncm_interface.xmit_tinyusb_ntb->nth.wBlockLength);
+  }
+
+  return true;
+}
+
 //-----------------------------------------------------------------------------
 //
 // all the netd_*() stuff (interface TinyUSB -> driver)
@@ -1060,6 +1109,8 @@ bool netd_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t result, uint32_
     // - if there is another transmit NTB waiting, try to start transmission
     xmit_put_ntb_into_free_list(ncm_interface.xmit_tinyusb_ntb);
     ncm_interface.xmit_tinyusb_ntb = NULL;
+    s_xmit_inflight_since_tick = 0;
+    s_xmit_stall_reported_for_start = 0;
     if (!xmit_insert_required_zlp(rhport, xferred_bytes)) {
       xmit_start_if_possible(rhport);
     }
