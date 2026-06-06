@@ -981,20 +981,24 @@ bool tud_network_ncm_tx_stalled(uint32_t timeout_ms) {
 // all the netd_*() stuff (interface TinyUSB -> driver)
 //
 /**
- * Initialize the driver data structures.
- * Might be called several times.
+ * Reset the driver data structures.
+ * When init_free_lists is true, all NTB buffers are returned to their idle free lists.
  */
-void netd_init(void) {
-  TU_LOG_DRV("netd_init()\n");
-
+static void ncm_reset_interface_state(bool init_free_lists) {
   memset(&ncm_interface, 0, sizeof(ncm_interface));
+  s_xmit_inflight_since_tick = 0;
+  s_xmit_stall_reported_for_start = 0;
+  s_xmit_stall_count = 0;
 
-  for (int i = 0; i < XMIT_NTB_N; ++i) {
-    ncm_interface.xmit_free_ntb[i] = &ncm_epbuf.xmit[i].ntb;
+  if (init_free_lists) {
+    for (int i = 0; i < XMIT_NTB_N; ++i) {
+      ncm_interface.xmit_free_ntb[i] = &ncm_epbuf.xmit[i].ntb;
+    }
+    for (int i = 0; i < RECV_NTB_N; ++i) {
+      ncm_interface.recv_free_ntb[i] = &ncm_epbuf.recv[i].ntb;
+    }
   }
-  for (int i = 0; i < RECV_NTB_N; ++i) {
-    ncm_interface.recv_free_ntb[i] = &ncm_epbuf.recv[i].ntb;
-  }
+
   // Default link state - can be configured via CFG_TUD_NCM_DEFAULT_LINK_UP
   #ifdef CFG_TUD_NCM_DEFAULT_LINK_UP
   ncm_interface.link_is_up = CFG_TUD_NCM_DEFAULT_LINK_UP;
@@ -1010,12 +1014,23 @@ void netd_init(void) {
   ncm_interface.ntb_input_size = CFG_TUD_NCM_OUT_NTB_MAX_SIZE;
   ncm_interface.max_datagram_size = CFG_TUD_NET_MTU;
   ncm_interface.crc_mode = 0;
+}
+
+/**
+ * Initialize the driver data structures.
+ * Might be called several times.
+ */
+void netd_init(void) {
+  TU_LOG_DRV("netd_init()\n");
+  ncm_reset_interface_state(true);
 } // netd_init
 
 /**
- * Deinit driver
+ * Deinit driver.
  */
 bool netd_deinit(void) {
+  TU_LOG_DRV("netd_deinit()\n");
+  ncm_reset_interface_state(false);
   return true;
 }
 
@@ -1025,8 +1040,7 @@ bool netd_deinit(void) {
  */
 void netd_reset(uint8_t rhport) {
   (void) rhport;
-
-  netd_init();
+  ncm_reset_interface_state(true);
 } // netd_reset
 
 /**
