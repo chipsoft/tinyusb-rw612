@@ -364,7 +364,14 @@ static void ncm_flush_data_paths(void) {
   s_xmit_inflight_since_tick = 0;
   s_xmit_stall_reported_for_start = 0;
 
-  if (ncm_interface.xmit_tinyusb_ntb != NULL) {
+  // Do NOT reclaim a buffer whose bulk transfer is still queued in the DCD.
+  // On an alt-setting flap the host may re-arm the data interface while the
+  // IN transfer is still in flight; freeing the buffer here (and NULLing the
+  // owner pointer) makes the later xfer-completion callback act on a stale
+  // NTB. Leave ownership with the pending transfer — netd_xfer_cb() reclaims
+  // it normally when the transfer completes. (T-312)
+  if (ncm_interface.xmit_tinyusb_ntb != NULL &&
+      !usbd_edpt_busy(ncm_interface.rhport, ncm_interface.ep_in)) {
     xmit_put_ntb_into_free_list(ncm_interface.xmit_tinyusb_ntb);
     ncm_interface.xmit_tinyusb_ntb = NULL;
   }
@@ -384,7 +391,13 @@ static void ncm_flush_data_paths(void) {
     }
   }
 
-  if (ncm_interface.recv_tinyusb_ntb != NULL) {
+  // Same rule for the RX path: if the bulk-OUT transfer is still queued in the
+  // DCD, do not free its buffer or NULL the owner pointer. Otherwise the host's
+  // alt=1 -> alt=0 -> alt=1 flap (Linux CDC-NCM bring-up) leaves the stale
+  // transfer to complete against a NULL recv_tinyusb_ntb -> NULL deref in
+  // recv_validate_datagram() -> HardFault. (T-312)
+  if (ncm_interface.recv_tinyusb_ntb != NULL &&
+      !usbd_edpt_busy(ncm_interface.rhport, ncm_interface.ep_out)) {
     recv_put_ntb_into_free_list(ncm_interface.recv_tinyusb_ntb);
     ncm_interface.recv_tinyusb_ntb = NULL;
   }
@@ -672,9 +685,16 @@ static void recv_try_to_start_new_reception(uint8_t rhport) {
  *    \a ndp16->wNextNdpIndex != 0 is not supported
  */
 static bool recv_validate_datagram(const recv_ntb_t *ntb, uint32_t len) {
-  const nth16_t *nth16 = &(ntb->nth);
-
   TU_LOG_DRV("recv_validate_datagram(%p, %d)\n", ntb, (int) len);
+
+  // Defensive: never dereference a NULL NTB (see T-312). The header access
+  // below would otherwise fault on a stale/cleared owner pointer.
+  if (ntb == NULL) {
+    TU_LOG_DRV("(EE) recv_validate_datagram: NULL ntb\n");
+    return false;
+  }
+
+  const nth16_t *nth16 = &(ntb->nth);
 
   // check header
   if (nth16->wHeaderLength != sizeof(nth16_t)) {
@@ -1105,7 +1125,11 @@ bool netd_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t result, uint32_
     // - make the NTB valid
     // - if ready transfer datagrams to the glue logic for further processing
     // - if there is a free receive buffer, initiate reception
-    if (!recv_validate_datagram(ncm_interface.recv_tinyusb_ntb, xferred_bytes)) {
+    if (ncm_interface.recv_tinyusb_ntb == NULL) {
+      // Completion for a transfer whose owning NTB was already reclaimed
+      // (e.g. an alt-setting flap). Nothing to validate — just re-arm. (T-312)
+      TU_LOG_DRV("(WW) ep_out xfer complete with no owning NTB, ignoring\n");
+    } else if (!recv_validate_datagram(ncm_interface.recv_tinyusb_ntb, xferred_bytes)) {
       // verification failed: ignore NTB and return it to free
       TU_LOG_DRV("Invalid datatagram. Ignoring NTB\n");
       recv_put_ntb_into_free_list(ncm_interface.recv_tinyusb_ntb);
