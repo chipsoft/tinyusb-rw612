@@ -389,10 +389,19 @@ static xmit_ntb_t *xmit_get_free_ntb(void) {
 static void xmit_put_ntb_into_ready_list(xmit_ntb_t *ready_ntb) {
   TU_LOG_DRV("xmit_put_ntb_into_ready_list(%p) %d\n", ready_ntb, ready_ntb->nth.wBlockLength);
 
+  // xmit_ready_head/tail/count are shared between the lwIP task
+  // (xmit_setup_next_glue_ntb, called from tud_network_can_xmit) and the
+  // USB task (xmit_start_if_possible, called from both netd_xfer_cb and
+  // tud_network_xmit's tail call) -- lock across the read-modify-write of
+  // the ring metadata, same as every other cross-task xmit_* state in this
+  // file (Codex review finding: a lost producer/consumer update here could
+  // strand an NTB or desync count vs. the array's actual contents).
+  osal_spin_lock(&s_xmit_glue_lock, false);
 #if XMIT_NTB_N == 1
   ncm_interface.xmit_ready_ntb[0] = ready_ntb;
 #else
   if (ncm_interface.xmit_ready_count >= XMIT_NTB_N) {
+    osal_spin_unlock(&s_xmit_glue_lock, false);
     TU_LOG_DRV("(EE) xmit_put_ntb_into_ready_list: ready list full\n");// this should not happen
     return;
   }
@@ -400,6 +409,7 @@ static void xmit_put_ntb_into_ready_list(xmit_ntb_t *ready_ntb) {
   ncm_interface.xmit_ready_head = (ncm_interface.xmit_ready_head + 1) % XMIT_NTB_N;
   ncm_interface.xmit_ready_count++;
 #endif
+  osal_spin_unlock(&s_xmit_glue_lock, false);
 } // xmit_put_ntb_into_ready_list
 
 /**
@@ -407,13 +417,16 @@ static void xmit_put_ntb_into_ready_list(xmit_ntb_t *ready_ntb) {
  * If the ready list is empty, return NULL.
  */
 static xmit_ntb_t *xmit_get_next_ready_ntb(void) {
+  osal_spin_lock(&s_xmit_glue_lock, false);
 #if XMIT_NTB_N == 1
   xmit_ntb_t *r = ncm_interface.xmit_ready_ntb[0];
   ncm_interface.xmit_ready_ntb[0] = NULL;
+  osal_spin_unlock(&s_xmit_glue_lock, false);
   TU_LOG_DRV("xmit_get_next_ready_ntb: %p\n", r);
   return r;
 #else
   if (ncm_interface.xmit_ready_count == 0) {
+    osal_spin_unlock(&s_xmit_glue_lock, false);
     return NULL; // empty
   }
 
@@ -421,6 +434,7 @@ static xmit_ntb_t *xmit_get_next_ready_ntb(void) {
   ncm_interface.xmit_ready_ntb[ncm_interface.xmit_ready_tail] = NULL;
   ncm_interface.xmit_ready_tail = (ncm_interface.xmit_ready_tail + 1) % XMIT_NTB_N;
   ncm_interface.xmit_ready_count--;
+  osal_spin_unlock(&s_xmit_glue_lock, false);
 
   TU_LOG_DRV("xmit_get_next_ready_ntb: %p\n", r);
   return r;
