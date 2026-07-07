@@ -1134,12 +1134,17 @@ bool netd_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t result, uint32_
     // - make the NTB valid
     // - if ready transfer datagrams to the glue logic for further processing
     // - if there is a free receive buffer, initiate reception
-    if (!recv_validate_datagram(ncm_interface.recv_tinyusb_ntb, xferred_bytes)) {
+    if (ncm_interface.recv_tinyusb_ntb == NULL) {
+      // Completion for a transfer whose owning NTB was already reclaimed
+      // (e.g. an alt-setting flap). Nothing to validate -- just re-arm. (T-312)
+      TU_LOG_DRV("(WW) ep_out xfer complete with no owning NTB, ignoring\n");
+    } else if (!recv_validate_datagram(ncm_interface.recv_tinyusb_ntb, xferred_bytes)) {
       // verification failed: ignore NTB and return it to free
       TU_LOG_DRV("Invalid datatagram. Ignoring NTB\n");
       recv_put_ntb_into_free_list(ncm_interface.recv_tinyusb_ntb);
     } else {
       // packet ok -> put it into ready list
+      ncm_interface.host_sent_datagram = true;
       recv_put_ntb_into_ready_list(ncm_interface.recv_tinyusb_ntb);
     }
     ncm_interface.recv_tinyusb_ntb = NULL;
@@ -1151,6 +1156,8 @@ bool netd_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t result, uint32_
     // - if there is another transmit NTB waiting, try to start transmission
     xmit_put_ntb_into_free_list(ncm_interface.xmit_tinyusb_ntb);
     ncm_interface.xmit_tinyusb_ntb = NULL;
+    s_xmit_inflight_since_millis = 0;
+    s_xmit_stall_reported_for_start = 0;
     if (!xmit_insert_required_zlp(rhport, xferred_bytes)) {
       xmit_start_if_possible(rhport);
     }
