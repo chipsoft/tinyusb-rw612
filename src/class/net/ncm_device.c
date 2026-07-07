@@ -445,13 +445,18 @@ static void ncm_flush_data_paths(void) {
     ncm_interface.xmit_tinyusb_ntb = NULL;
   }
 
+  // Snapshot and clear under lock, then act on the snapshot outside it --
+  // mirrors the pattern in xmit_setup_next_glue_ntb() below. Keeps the
+  // critical section to a pointer swap instead of a logging call + list scan.
   osal_spin_lock(&s_xmit_glue_lock, false);
-  if (ncm_interface.xmit_glue_ntb != NULL) {
-    xmit_put_ntb_into_free_list(ncm_interface.xmit_glue_ntb);
-    ncm_interface.xmit_glue_ntb = NULL;
-  }
+  xmit_ntb_t *stale_glue_ntb = ncm_interface.xmit_glue_ntb;
+  ncm_interface.xmit_glue_ntb = NULL;
   ncm_interface.xmit_glue_ntb_datagram_ndx = 0;
   osal_spin_unlock(&s_xmit_glue_lock, false);
+
+  if (stale_glue_ntb != NULL) {
+    xmit_put_ntb_into_free_list(stale_glue_ntb);
+  }
 
   for (int i = 0; i < XMIT_NTB_N; ++i) {
     if (ncm_interface.xmit_ready_ntb[i] != NULL) {
@@ -920,6 +925,18 @@ bool tud_network_can_xmit(uint16_t size) {
 
   TU_ASSERT(size <= ncm_interface.xmit_max_ntb_size - (sizeof(nth16_t) + sizeof(ndp16_t) + 2 * sizeof(ndp16_datagram_t)), false);
 
+  if (!ncm_host_configured_for_tx()) {
+    TU_LOG_DRV("  !tud_network_can_xmit host not configured (alt=%u, filter=0x%04x, host_rx=%u)\n",
+               ncm_interface.itf_data_alt, ncm_interface.packet_filter, ncm_interface.host_sent_datagram);
+    if (ncm_interface.itf_data_alt == 1 &&
+        ncm_interface.packet_filter == 0 &&
+        !ncm_interface.host_sent_datagram &&
+        ncm_interface.host_config_blocked_tries < NCM_HOST_CONFIG_GRACE_BLOCKED_TRIES) {
+      ncm_interface.host_config_blocked_tries++;
+    }
+    return false;
+  }
+
   if (xmit_requested_datagram_fits_into_current_ntb(size) || xmit_setup_next_glue_ntb()) {
     // -> everything is fine
     return true;
@@ -936,20 +953,27 @@ bool tud_network_can_xmit(uint16_t size) {
 void tud_network_xmit(void *ref, uint16_t arg) {
   TU_LOG_DRV("tud_network_xmit(%p, %d)\n", ref, arg);
 
-  if (ncm_interface.xmit_glue_ntb == NULL) {
+  // Snapshot xmit_glue_ntb and reserve the datagram slot atomically so that
+  // a concurrent xmit_start_if_possible()/ncm_flush_data_paths() (USB task)
+  // cannot steal or NULL the pointer, or reuse the slot, between our NULL
+  // check and our NTB write.
+  osal_spin_lock(&s_xmit_glue_lock, false);
+  xmit_ntb_t *ntb = ncm_interface.xmit_glue_ntb;
+  if (ntb == NULL) {
+    osal_spin_unlock(&s_xmit_glue_lock, false);
     TU_LOG_DRV("(EE) tud_network_xmit: no buffer\n");// must not happen (really)
     return;
   }
+  uint16_t ndx = ncm_interface.xmit_glue_ntb_datagram_ndx;
+  ncm_interface.xmit_glue_ntb_datagram_ndx = (uint16_t) (ndx + 1);
+  osal_spin_unlock(&s_xmit_glue_lock, false);
 
-  xmit_ntb_t *ntb = ncm_interface.xmit_glue_ntb;
-
-  // copy new datagram to the end of the current NTB
+  // copy new datagram to the end of the current NTB (ntb and ndx exclusively ours)
   uint16_t size = tud_network_xmit_cb(ntb->data + ntb->nth.wBlockLength, ref, arg);
 
-  // correct NTB internals
-  ntb->ndp_datagram[ncm_interface.xmit_glue_ntb_datagram_ndx].wDatagramIndex = ntb->nth.wBlockLength;
-  ntb->ndp_datagram[ncm_interface.xmit_glue_ntb_datagram_ndx].wDatagramLength = size;
-  ncm_interface.xmit_glue_ntb_datagram_ndx += 1;
+  // correct NTB internals using the captured slot index
+  ntb->ndp_datagram[ndx].wDatagramIndex = ntb->nth.wBlockLength;
+  ntb->ndp_datagram[ndx].wDatagramLength = size;
 
   ntb->nth.wBlockLength += (uint16_t) (size + XMIT_ALIGN_OFFSET(size));
 
@@ -1209,6 +1233,11 @@ bool netd_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t 
             ncm_interface.notification_xmit_state = NOTIFICATION_SPEED;
             ncm_interface.host_sent_datagram = false;
             ncm_interface.host_config_blocked_tries = 0;
+            // Also clear packet_filter: otherwise a stale nonzero value from
+            // the previous session survives an alt=1->0->1 flap and makes
+            // ncm_host_strictly_configured_for_tx() report "ready" on the new
+            // session before the host has reprogrammed the filter.
+            ncm_interface.packet_filter = 0;
           }
           tud_control_status(rhport, request);
         } break;
