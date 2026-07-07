@@ -62,6 +62,7 @@
 #endif
 
 #define TU_LOG_DRV(...)   TU_LOG(CFG_TUD_NCM_LOG_LEVEL, __VA_ARGS__)
+#define NCM_HOST_CONFIG_GRACE_BLOCKED_TRIES 20u
 
 // Alignment must be 4
 #define TUD_NCM_ALIGNMENT   4
@@ -125,6 +126,16 @@ typedef struct {
   uint16_t xmit_max_datagrams;                          // maximum datagrams per NTB device may send
   ncm_ntb_input_size_t ntb_input_size;
 
+  // macOS/interop control-request extensions and TX-readiness gating
+  uint16_t host_config_blocked_tries;                   // count blocked TX tries while host setup is incomplete
+  uint16_t packet_filter;                               // host packet filter selection
+  bool host_sent_datagram;                              // host has sent at least one data datagram
+  uint8_t class_request_data[512];                      // scratch buffer for optional class requests
+  uint8_t net_address[16];                              // host-visible network address blob
+  uint16_t net_address_len;                             // valid bytes in net_address
+  uint16_t ntb_format;                                  // 0 = NTH16/NDP16
+  uint16_t crc_mode;                                    // 0 = no CRC
+
   // misc
   bool tud_network_recv_renew_active;                   // tud_network_recv_renew() is active (avoid recursive invocations)
   bool tud_network_recv_renew_process_again;            // tud_network_recv_renew() should process again
@@ -144,6 +155,54 @@ typedef struct {
 
 static ncm_interface_t ncm_interface;
 CFG_TUD_MEM_SECTION static ncm_epbuf_t ncm_epbuf;
+
+// Protects concurrent access to xmit_glue_ntb / xmit_glue_ntb_datagram_ndx
+// between the lwIP task (tud_network_can_xmit / tud_network_xmit) and the
+// USB task (tud_task -> ncm_flush_data_paths / xmit_start_if_possible).
+static osal_spinlock_t s_xmit_glue_lock;
+static uint32_t s_xmit_inflight_since_millis;
+static uint32_t s_xmit_stall_reported_for_start;
+static uint32_t s_xmit_stall_count;
+static void recv_put_ntb_into_free_list(recv_ntb_t *free_ntb);
+
+static bool ncm_host_strictly_configured_for_tx(void) {
+  return (ncm_interface.itf_data_alt == 1) &&
+         (ncm_interface.packet_filter != 0 || ncm_interface.host_sent_datagram);
+}
+
+static bool ncm_host_configured_for_tx(void) {
+  if (ncm_host_strictly_configured_for_tx()) {
+    return true;
+  }
+
+  return ncm_interface.host_config_blocked_tries >= NCM_HOST_CONFIG_GRACE_BLOCKED_TRIES;
+}
+
+bool tud_network_ncm_data_interface_active(void) {
+  return ncm_interface.itf_data_alt == 1;
+}
+
+bool tud_network_ncm_host_configured(void) {
+  return ncm_host_configured_for_tx();
+}
+
+bool tud_network_ncm_host_strictly_configured(void) {
+  return ncm_host_strictly_configured_for_tx();
+}
+
+bool tud_network_ncm_tx_stalled(uint32_t timeout_ms) {
+  if (s_xmit_inflight_since_millis == 0) {
+    return false;
+  }
+  if ((osal_time_millis() - s_xmit_inflight_since_millis) < timeout_ms) {
+    return false;
+  }
+  if (s_xmit_stall_reported_for_start != s_xmit_inflight_since_millis) {
+    s_xmit_stall_reported_for_start = s_xmit_inflight_since_millis;
+    s_xmit_stall_count++;
+  }
+  return true;
+}
 
 //--------------------------------------------------------------------+
 // Weak stubs: invoked if no strong implementation is available
@@ -204,6 +263,16 @@ TU_ATTR_ALIGNED(4) static const ntb_parameters_t ntb_parameters = {
 static void notification_xmit(uint8_t rhport, bool force_next) {
   TU_LOG_DRV("notification_xmit(%d, %d) - %d %d\n", force_next, rhport, ncm_interface.notification_xmit_state, ncm_interface.notification_xmit_is_running);
 
+  // Never attempt to queue a notification while endpoint is busy.
+  // usbd_edpt_xfer() asserts on busy endpoint.
+  if (usbd_edpt_busy(rhport, ncm_interface.ep_notif)) {
+    TU_LOG_DRV("  notification endpoint busy, defer\n");
+    // Keep "running" false here: no transfer was queued.
+    // Otherwise future non-force retries can be blocked forever.
+    ncm_interface.notification_xmit_is_running = false;
+    return;
+  }
+
   if (!force_next && ncm_interface.notification_xmit_is_running) {
     return;
   }
@@ -233,10 +302,14 @@ static void notification_xmit(uint8_t rhport, bool force_next) {
 
     uint16_t notif_len = sizeof(notify_speed_change.header) + notify_speed_change.header.wLength;
     ncm_epbuf.epnotif = notify_speed_change;
-    usbd_edpt_xfer(rhport, ncm_interface.ep_notif, (uint8_t*) &ncm_epbuf.epnotif, notif_len, false);
-
-    ncm_interface.notification_xmit_state = NOTIFICATION_CONNECTED;
-    ncm_interface.notification_xmit_is_running = true;
+    bool queued = usbd_edpt_xfer(rhport, ncm_interface.ep_notif, (uint8_t*) &ncm_epbuf.epnotif, notif_len, false);
+    if (queued) {
+      ncm_interface.notification_xmit_state = NOTIFICATION_CONNECTED;
+      ncm_interface.notification_xmit_is_running = true;
+    } else {
+      TU_LOG_DRV("(WW) notification speed xfer not queued, will retry\n");
+      ncm_interface.notification_xmit_is_running = false;
+    }
   } else if (ncm_interface.notification_xmit_state == NOTIFICATION_CONNECTED) {
     TU_LOG_DRV("  NOTIFICATION_CONNECTED\n");
     ncm_notify_t notify_connected = {
@@ -255,10 +328,14 @@ static void notification_xmit(uint8_t rhport, bool force_next) {
 
     uint16_t notif_len = sizeof(notify_connected.header) + notify_connected.header.wLength;
     ncm_epbuf.epnotif = notify_connected;
-    usbd_edpt_xfer(rhport, ncm_interface.ep_notif, (uint8_t *) &ncm_epbuf.epnotif, notif_len, false);
-
-    ncm_interface.notification_xmit_state = NOTIFICATION_DONE;
-    ncm_interface.notification_xmit_is_running = true;
+    bool queued = usbd_edpt_xfer(rhport, ncm_interface.ep_notif, (uint8_t *) &ncm_epbuf.epnotif, notif_len, false);
+    if (queued) {
+      ncm_interface.notification_xmit_state = NOTIFICATION_DONE;
+      ncm_interface.notification_xmit_is_running = true;
+    } else {
+      TU_LOG_DRV("(WW) notification connected xfer not queued, will retry\n");
+      ncm_interface.notification_xmit_is_running = false;
+    }
   } else {
     TU_LOG_DRV("  NOTIFICATION_FINISHED\n");
     ncm_interface.notification_xmit_is_running = false;
@@ -349,6 +426,76 @@ static xmit_ntb_t *xmit_get_next_ready_ntb(void) {
 } // xmit_get_next_ready_ntb
 
 /**
+ * Flush buffered TX/RX NTBs after host data-interface alt-setting changes.
+ * This prevents stale in-flight state from blocking traffic after alt flaps.
+ */
+static void ncm_flush_data_paths(void) {
+  s_xmit_inflight_since_millis = 0;
+  s_xmit_stall_reported_for_start = 0;
+
+  // Do NOT reclaim a buffer whose bulk transfer is still queued in the DCD.
+  // On an alt-setting flap the host may re-arm the data interface while the
+  // IN transfer is still in flight; freeing the buffer here (and NULLing the
+  // owner pointer) makes the later xfer-completion callback act on a stale
+  // NTB. Leave ownership with the pending transfer -- netd_xfer_cb() reclaims
+  // it normally when the transfer completes. (T-312)
+  if (ncm_interface.xmit_tinyusb_ntb != NULL &&
+      !usbd_edpt_busy(ncm_interface.rhport, ncm_interface.ep_in)) {
+    xmit_put_ntb_into_free_list(ncm_interface.xmit_tinyusb_ntb);
+    ncm_interface.xmit_tinyusb_ntb = NULL;
+  }
+
+  osal_spin_lock(&s_xmit_glue_lock, false);
+  if (ncm_interface.xmit_glue_ntb != NULL) {
+    xmit_put_ntb_into_free_list(ncm_interface.xmit_glue_ntb);
+    ncm_interface.xmit_glue_ntb = NULL;
+  }
+  ncm_interface.xmit_glue_ntb_datagram_ndx = 0;
+  osal_spin_unlock(&s_xmit_glue_lock, false);
+
+  for (int i = 0; i < XMIT_NTB_N; ++i) {
+    if (ncm_interface.xmit_ready_ntb[i] != NULL) {
+      xmit_put_ntb_into_free_list(ncm_interface.xmit_ready_ntb[i]);
+      ncm_interface.xmit_ready_ntb[i] = NULL;
+    }
+  }
+  #if XMIT_NTB_N > 1
+  ncm_interface.xmit_ready_head = 0;
+  ncm_interface.xmit_ready_tail = 0;
+  ncm_interface.xmit_ready_count = 0;
+  #endif
+
+  // Same rule for the RX path: if the bulk-OUT transfer is still queued in the
+  // DCD, do not free its buffer or NULL the owner pointer. Otherwise the host's
+  // alt=1 -> alt=0 -> alt=1 flap (Linux CDC-NCM bring-up) leaves the stale
+  // transfer to complete against a NULL recv_tinyusb_ntb -> NULL deref in
+  // recv_validate_datagram() -> HardFault. (T-312)
+  if (ncm_interface.recv_tinyusb_ntb != NULL &&
+      !usbd_edpt_busy(ncm_interface.rhport, ncm_interface.ep_out)) {
+    recv_put_ntb_into_free_list(ncm_interface.recv_tinyusb_ntb);
+    ncm_interface.recv_tinyusb_ntb = NULL;
+  }
+
+  if (ncm_interface.recv_glue_ntb != NULL) {
+    recv_put_ntb_into_free_list(ncm_interface.recv_glue_ntb);
+    ncm_interface.recv_glue_ntb = NULL;
+  }
+  ncm_interface.recv_glue_ntb_datagram_ndx = 0;
+
+  for (int i = 0; i < RECV_NTB_N; ++i) {
+    if (ncm_interface.recv_ready_ntb[i] != NULL) {
+      recv_put_ntb_into_free_list(ncm_interface.recv_ready_ntb[i]);
+      ncm_interface.recv_ready_ntb[i] = NULL;
+    }
+  }
+  #if RECV_NTB_N > 1
+  ncm_interface.recv_ready_head = 0;
+  ncm_interface.recv_ready_tail = 0;
+  ncm_interface.recv_ready_count = 0;
+  #endif
+} // ncm_flush_data_paths
+
+/**
  * Transmit a ZLP if required
  *
  * \note
@@ -392,6 +539,11 @@ static void xmit_start_if_possible(uint8_t rhport) {
     TU_LOG_DRV("(EE) !xmit_start_if_possible 2\n");
     return;
   }
+  if (!ncm_host_configured_for_tx()) {
+    TU_LOG_DRV("  !xmit_start_if_possible host not configured (filter=0x%04x, host_rx=%u)\n",
+               ncm_interface.packet_filter, ncm_interface.host_sent_datagram);
+    return;
+  }
   if (usbd_edpt_busy(rhport, ncm_interface.ep_in)) {
     TU_LOG_DRV("  !xmit_start_if_possible 3\n");
     return;
@@ -399,12 +551,17 @@ static void xmit_start_if_possible(uint8_t rhport) {
 
   ncm_interface.xmit_tinyusb_ntb = xmit_get_next_ready_ntb();
   if (ncm_interface.xmit_tinyusb_ntb == NULL) {
+    // Guard and steal of xmit_glue_ntb must be atomic with respect to the
+    // lwIP task that publishes / reads xmit_glue_ntb and datagram_ndx.
+    osal_spin_lock(&s_xmit_glue_lock, false);
     if (ncm_interface.xmit_glue_ntb == NULL || ncm_interface.xmit_glue_ntb_datagram_ndx == 0) {
       // -> really nothing is waiting
+      osal_spin_unlock(&s_xmit_glue_lock, false);
       return;
     }
     ncm_interface.xmit_tinyusb_ntb = ncm_interface.xmit_glue_ntb;
     ncm_interface.xmit_glue_ntb = NULL;
+    osal_spin_unlock(&s_xmit_glue_lock, false);
   }
 
   #if CFG_TUD_NCM_LOG_LEVEL >= 3
@@ -418,8 +575,21 @@ static void xmit_start_if_possible(uint8_t rhport) {
     TU_LOG_DRV(">> %d %d\n", ncm_interface.xmit_tinyusb_ntb->nth.wBlockLength, ncm_interface.xmit_glue_ntb_datagram_ndx);
   }
 
-  // Kick off an endpoint transfer
-  usbd_edpt_xfer(0, ncm_interface.ep_in, ncm_interface.xmit_tinyusb_ntb->data, ncm_interface.xmit_tinyusb_ntb->nth.wBlockLength, false);
+  // Kick off an endpoint transfer. If the DCD refuses the transfer even
+  // though usbd_edpt_busy() was false, do not leave the NTB owned by the
+  // TinyUSB in-flight slot forever. Requeue it so a later SOF/callback can
+  // retry and so tud_network_can_xmit() does not wedge permanently.
+  if (usbd_edpt_xfer(rhport, ncm_interface.ep_in, ncm_interface.xmit_tinyusb_ntb->data,
+                     ncm_interface.xmit_tinyusb_ntb->nth.wBlockLength, false)) {
+    s_xmit_inflight_since_millis = osal_time_millis();
+    s_xmit_stall_reported_for_start = 0;
+  } else {
+    TU_LOG_DRV("(EE) xmit_start_if_possible: usbd_edpt_xfer failed\n");
+    xmit_put_ntb_into_ready_list(ncm_interface.xmit_tinyusb_ntb);
+    ncm_interface.xmit_tinyusb_ntb = NULL;
+    s_xmit_inflight_since_millis = 0;
+    s_xmit_stall_reported_for_start = 0;
+  }
 } // xmit_start_if_possible
 
 /**
@@ -446,34 +616,44 @@ static bool xmit_requested_datagram_fits_into_current_ntb(uint16_t datagram_size
 static bool xmit_setup_next_glue_ntb(void) {
   TU_LOG_DRV("xmit_setup_next_glue_ntb - %p\n", ncm_interface.xmit_glue_ntb);
 
-  if (ncm_interface.xmit_glue_ntb != NULL) {
+  // Snapshot and clear the old glue NTB under lock so the USB task cannot
+  // race on xmit_glue_ntb while we decide what to do with the old buffer.
+  osal_spin_lock(&s_xmit_glue_lock, false);
+  xmit_ntb_t *old_ntb = ncm_interface.xmit_glue_ntb;
+  ncm_interface.xmit_glue_ntb = NULL;
+  osal_spin_unlock(&s_xmit_glue_lock, false);
+
+  if (old_ntb != NULL) {
     // put NTB into waiting list (the new datagram did not fit in)
-    xmit_put_ntb_into_ready_list(ncm_interface.xmit_glue_ntb);
+    xmit_put_ntb_into_ready_list(old_ntb);
   }
 
-  ncm_interface.xmit_glue_ntb = xmit_get_free_ntb();// get next buffer (if any)
-  if (ncm_interface.xmit_glue_ntb == NULL) {
+  // Allocate next free NTB -- non-blocking array scan, no lock needed here.
+  xmit_ntb_t *ntb = xmit_get_free_ntb();
+  if (ntb == NULL) {
     TU_LOG_DRV("  xmit_setup_next_glue_ntb - nothing free\n");// should happen rarely
     return false;
   }
 
-  ncm_interface.xmit_glue_ntb_datagram_ndx = 0;
-
-  xmit_ntb_t *ntb = ncm_interface.xmit_glue_ntb;
-
-  // Fill in NTB header
+  // Fill in NTB and NDP16 headers via local variable -- no shared-state access.
   ntb->nth.dwSignature = NTH16_SIGNATURE;
   ntb->nth.wHeaderLength = sizeof(ntb->nth);
   ntb->nth.wSequence = ncm_interface.xmit_sequence++;
   ntb->nth.wBlockLength = sizeof(ntb->nth) + sizeof(ntb->ndp) + sizeof(ntb->ndp_datagram);
   ntb->nth.wNdpIndex = sizeof(ntb->nth);
 
-  // Fill in NDP16 header and terminator
   ntb->ndp.dwSignature = NDP16_SIGNATURE_NCM0;
   ntb->ndp.wLength = sizeof(ntb->ndp) + sizeof(ntb->ndp_datagram);
   ntb->ndp.wNextNdpIndex = 0;
 
   memset(ntb->ndp_datagram, 0, sizeof(ntb->ndp_datagram));
+
+  // Publish: set datagram_ndx and xmit_glue_ntb together under lock so the
+  // USB task always sees a consistent (ptr, ndx) pair.
+  osal_spin_lock(&s_xmit_glue_lock, false);
+  ncm_interface.xmit_glue_ntb_datagram_ndx = 0;
+  ncm_interface.xmit_glue_ntb = ntb;
+  osal_spin_unlock(&s_xmit_glue_lock, false);
   return true;
 } // xmit_setup_next_glue_ntb
 
@@ -596,9 +776,16 @@ static void recv_try_to_start_new_reception(uint8_t rhport) {
  *    \a ndp16->wNextNdpIndex != 0 is not supported
  */
 static bool recv_validate_datagram(const recv_ntb_t *ntb, uint32_t len) {
-  const nth16_t *nth16 = &(ntb->nth);
-
   TU_LOG_DRV("recv_validate_datagram(%p, %d)\n", ntb, (int) len);
+
+  // Defensive: never dereference a NULL NTB (see T-312). The header access
+  // below would otherwise fault on a stale/cleared owner pointer.
+  if (ntb == NULL) {
+    TU_LOG_DRV("(EE) recv_validate_datagram: NULL ntb\n");
+    return false;
+  }
+
+  const nth16_t *nth16 = &(ntb->nth);
 
   // check header
   if (nth16->wHeaderLength != sizeof(nth16_t)) {
@@ -997,14 +1184,24 @@ bool netd_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t 
         case TUSB_REQ_SET_INTERFACE: {
           TU_VERIFY(ncm_interface.itf_num + 1 == request->wIndex && request->wValue < 2, false);
 
+          uint8_t prev_alt = ncm_interface.itf_data_alt;
           ncm_interface.itf_data_alt = (uint8_t) request->wValue;
+          if (prev_alt != ncm_interface.itf_data_alt) {
+            // Alt-setting flap: discard stale in-flight NTB state so a later
+            // completion callback cannot act on a buffer this reset already
+            // freed (T-312 HardFault on Linux NCM alt-setting flap).
+            ncm_flush_data_paths();
+          }
 
           if (ncm_interface.itf_data_alt == 1) {
+            ncm_interface.host_config_blocked_tries = 0;
             tud_network_recv_renew_r(rhport);
             notification_xmit(rhport, false);
           } else {
             // Reset notification state to send link state update when interface is re-activated
             ncm_interface.notification_xmit_state = NOTIFICATION_SPEED;
+            ncm_interface.host_sent_datagram = false;
+            ncm_interface.host_config_blocked_tries = 0;
           }
           tud_control_status(rhport, request);
         } break;
@@ -1016,7 +1213,10 @@ bool netd_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t 
       break;
 
     case TUSB_REQ_TYPE_CLASS:
-      TU_VERIFY(ncm_interface.itf_num == request->wIndex, false);
+      // Be permissive: some hosts issue NCM class requests using either the
+      // control interface index or the associated data interface index.
+      TU_VERIFY((request->wIndex == ncm_interface.itf_num) ||
+                (request->wIndex == (uint16_t) (ncm_interface.itf_num + 1)), false);
       switch (request->bRequest) {
         case NCM_GET_NTB_PARAMETERS: {
           if (stage != CONTROL_STAGE_SETUP) {
@@ -1034,8 +1234,123 @@ bool netd_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t 
           // Some hosts issue this request even if ETH_FILTER is not advertised,
           // see https://bugzilla.kernel.org/show_bug.cgi?id=217290
 
+          ncm_interface.packet_filter = request->wValue;
           tud_network_set_packet_filter_cb(request->wValue);
           tud_control_xfer(rhport, request, NULL, 0);
+
+          // Some hosts (including macOS) expect/benefit from a fresh
+          // NETWORK_CONNECTION notification after packet filter programming.
+          if (ncm_interface.link_is_up) {
+            ncm_interface.notification_xmit_state = NOTIFICATION_CONNECTED;
+            notification_xmit(rhport, false);
+          }
+
+          // Host is now ready to receive payload traffic.
+          xmit_start_if_possible(rhport);
+        } break;
+
+        case NCM_SET_ETHERNET_MULTICAST_FILTERS:
+        case NCM_SET_ETHERNET_POWER_MANAGEMENT_PATTERN_FILTER: {
+          if (stage != CONTROL_STAGE_SETUP) {
+            return true;
+          }
+          uint16_t xfer_len = request->wLength;
+          if (xfer_len > sizeof(ncm_interface.class_request_data)) {
+            xfer_len = sizeof(ncm_interface.class_request_data);
+          }
+
+          if (xfer_len > 0) {
+            tud_control_xfer(rhport, request, (void *) (uintptr_t) &ncm_interface.class_request_data, xfer_len);
+          } else {
+            tud_control_xfer(rhport, request, NULL, 0);
+          }
+        } break;
+
+        case NCM_GET_ETHERNET_POWER_MANAGEMENT_PATTERN_FILTER:
+        case NCM_GET_ETHERNET_STATISTIC: {
+          if (stage != CONTROL_STAGE_SETUP) {
+            return true;
+          }
+          uint16_t xfer_len = request->wLength;
+          if (xfer_len > sizeof(ncm_interface.class_request_data)) {
+            xfer_len = sizeof(ncm_interface.class_request_data);
+          }
+
+          tu_memclr(ncm_interface.class_request_data, xfer_len);
+          tud_control_xfer(rhport, request, (void *) (uintptr_t) &ncm_interface.class_request_data, xfer_len);
+        } break;
+
+        case NCM_GET_NET_ADDRESS: {
+          if (stage != CONTROL_STAGE_SETUP) {
+            return true;
+          }
+          tud_control_xfer(rhport, request, (void *) (uintptr_t) ncm_interface.net_address,
+                           ncm_interface.net_address_len);
+        } break;
+
+        case NCM_SET_NET_ADDRESS: {
+          if (stage != CONTROL_STAGE_SETUP) {
+            return true;
+          }
+          TU_VERIFY(request->wLength <= sizeof(ncm_interface.net_address), false);
+          ncm_interface.net_address_len = request->wLength;
+          tud_control_xfer(rhport, request, (void *) (uintptr_t) ncm_interface.net_address,
+                           ncm_interface.net_address_len);
+        } break;
+
+        case NCM_GET_NTB_FORMAT: {
+          if (stage != CONTROL_STAGE_SETUP) {
+            return true;
+          }
+          tud_control_xfer(rhport, request, (void *) (uintptr_t) &ncm_interface.ntb_format,
+                           sizeof(ncm_interface.ntb_format));
+        } break;
+
+        case NCM_SET_NTB_FORMAT: {
+          if (stage != CONTROL_STAGE_SETUP) {
+            return true;
+          }
+          if (request->wLength != 0 || request->wValue != 0) {
+            return false;
+          }
+          ncm_interface.ntb_format = 0;
+          tud_control_status(rhport, request);
+        } break;
+
+        case NCM_GET_MAX_DATAGRAM_SIZE: {
+          if (stage != CONTROL_STAGE_SETUP) {
+            return true;
+          }
+          uint16_t max_datagram_size = CFG_TUD_NET_MTU;
+          tud_control_xfer(rhport, request, (void *) (uintptr_t) &max_datagram_size, sizeof(max_datagram_size));
+        } break;
+
+        case NCM_SET_MAX_DATAGRAM_SIZE: {
+          if (stage != CONTROL_STAGE_SETUP) {
+            return true;
+          }
+          TU_VERIFY(request->wLength == sizeof(uint16_t), false);
+          uint16_t max_datagram_size = CFG_TUD_NET_MTU;
+          tud_control_xfer(rhport, request, (void *) (uintptr_t) &max_datagram_size, sizeof(max_datagram_size));
+        } break;
+
+        case NCM_GET_CRC_MODE: {
+          if (stage != CONTROL_STAGE_SETUP) {
+            return true;
+          }
+          tud_control_xfer(rhport, request, (void *) (uintptr_t) &ncm_interface.crc_mode,
+                           sizeof(ncm_interface.crc_mode));
+        } break;
+
+        case NCM_SET_CRC_MODE: {
+          if (stage != CONTROL_STAGE_SETUP) {
+            return true;
+          }
+          if (request->wLength != 0 || request->wValue > 1) {
+            return false;
+          }
+          ncm_interface.crc_mode = (uint16_t) request->wValue;
+          tud_control_status(rhport, request);
         } break;
 
         case NCM_GET_NTB_INPUT_SIZE: {

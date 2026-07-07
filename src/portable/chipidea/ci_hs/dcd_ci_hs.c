@@ -183,6 +183,13 @@ typedef struct {
 
 CFG_TUD_MEM_SECTION TU_ATTR_ALIGNED(2048) static dcd_data_t _dcd_data;
 
+static uint32_t s_dcd_double_prime_count;
+static uint32_t s_dcd_double_prime_log_count;
+
+uint32_t dcd_ci_hs_get_double_prime_count(void) {
+  return s_dcd_double_prime_count;
+}
+
 //--------------------------------------------------------------------+
 // Prototypes and Helper Functions
 //--------------------------------------------------------------------+
@@ -538,6 +545,17 @@ bool dcd_edpt_xfer(uint8_t rhport, uint8_t ep_addr, uint8_t *buffer, uint16_t to
 
   dcd_qhd_t *p_qhd = &_dcd_data.qhd[epnum][dir];
   dcd_qtd_t *p_qtd = &_dcd_data.qtd[epnum][dir];
+
+  if (((volatile uint32_t const*) p_qtd)[1] & 0x00000080u) {
+    s_dcd_double_prime_count++;
+    if ((s_dcd_double_prime_count <= 5u) || ((s_dcd_double_prime_count % 100u) == 0u)) {
+      s_dcd_double_prime_log_count++;
+      TU_LOG1("dcd_edpt_xfer: refusing active qTD overwrite ep=%u dir=%u count=%lu logs=%lu\r\n",
+              epnum, dir, (unsigned long) s_dcd_double_prime_count,
+              (unsigned long) s_dcd_double_prime_log_count);
+    }
+    return false;
+  }
 
   // Prepare qtd
   qtd_init(p_qtd, buffer, total_bytes);
