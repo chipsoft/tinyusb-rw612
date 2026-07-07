@@ -135,6 +135,7 @@ typedef struct {
   uint16_t net_address_len;                             // valid bytes in net_address
   uint16_t ntb_format;                                  // 0 = NTH16/NDP16
   uint16_t crc_mode;                                    // 0 = no CRC
+  uint16_t max_datagram_size;                           // negotiated max datagram size (persistent -- see NCM_SET_MAX_DATAGRAM_SIZE)
 
   // misc
   bool tud_network_recv_renew_active;                   // tud_network_recv_renew() is active (avoid recursive invocations)
@@ -953,10 +954,20 @@ bool tud_network_can_xmit(uint16_t size) {
 void tud_network_xmit(void *ref, uint16_t arg) {
   TU_LOG_DRV("tud_network_xmit(%p, %d)\n", ref, arg);
 
-  // Snapshot xmit_glue_ntb and reserve the datagram slot atomically so that
-  // a concurrent xmit_start_if_possible()/ncm_flush_data_paths() (USB task)
-  // cannot steal or NULL the pointer, or reuse the slot, between our NULL
-  // check and our NTB write.
+  // Hold the lock across the entire fill+publish sequence, not just the
+  // pointer/index snapshot. xmit_glue_ntb_datagram_ndx is the signal
+  // xmit_start_if_possible() checks to decide the buffer has a complete
+  // datagram ready to DMA out; publishing it (releasing the lock) before
+  // tud_network_xmit_cb() has copied the payload and before ndp_datagram/
+  // wBlockLength are updated lets the USB task steal and start
+  // transmitting this NTB while we are still writing into the same memory
+  // -- a live write-during-DMA-read race (Codex review finding). Ends up
+  // consistent with, and covered by, the T-145 lock this port already
+  // added to xmit_start_if_possible()/xmit_setup_next_glue_ntb().
+  //
+  // tud_network_xmit_cb() (bsp_usb_ncm.c) is a bounded, non-blocking
+  // pbuf-chain memcpy -- safe to run under this task-context critical
+  // section.
   osal_spin_lock(&s_xmit_glue_lock, false);
   xmit_ntb_t *ntb = ncm_interface.xmit_glue_ntb;
   if (ntb == NULL) {
@@ -965,17 +976,17 @@ void tud_network_xmit(void *ref, uint16_t arg) {
     return;
   }
   uint16_t ndx = ncm_interface.xmit_glue_ntb_datagram_ndx;
-  ncm_interface.xmit_glue_ntb_datagram_ndx = (uint16_t) (ndx + 1);
-  osal_spin_unlock(&s_xmit_glue_lock, false);
 
-  // copy new datagram to the end of the current NTB (ntb and ndx exclusively ours)
+  // copy new datagram to the end of the current NTB
   uint16_t size = tud_network_xmit_cb(ntb->data + ntb->nth.wBlockLength, ref, arg);
 
-  // correct NTB internals using the captured slot index
+  // correct NTB internals using the captured slot index, then publish by
+  // advancing xmit_glue_ntb_datagram_ndx -- all still under the lock.
   ntb->ndp_datagram[ndx].wDatagramIndex = ntb->nth.wBlockLength;
   ntb->ndp_datagram[ndx].wDatagramLength = size;
-
   ntb->nth.wBlockLength += (uint16_t) (size + XMIT_ALIGN_OFFSET(size));
+  ncm_interface.xmit_glue_ntb_datagram_ndx = (uint16_t) (ndx + 1);
+  osal_spin_unlock(&s_xmit_glue_lock, false);
 
   if (ntb->nth.wBlockLength > CFG_TUD_NCM_IN_NTB_MAX_SIZE) {
     TU_LOG_DRV("(EE) tud_network_xmit: buffer overflow\n"); // must not happen (really)
@@ -1064,6 +1075,7 @@ void netd_init(void) {
 
   ncm_interface.xmit_max_ntb_size = CFG_TUD_NCM_IN_NTB_MAX_SIZE;
   ncm_interface.xmit_max_datagrams = CFG_TUD_NCM_IN_MAX_DATAGRAMS_PER_NTB;
+  ncm_interface.max_datagram_size = CFG_TUD_NET_MTU;
 
   for (int i = 0; i < XMIT_NTB_N; ++i) {
     ncm_interface.xmit_free_ntb[i] = &ncm_epbuf.xmit[i].ntb;
@@ -1357,17 +1369,27 @@ bool netd_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t 
           if (stage != CONTROL_STAGE_SETUP) {
             return true;
           }
-          uint16_t max_datagram_size = CFG_TUD_NET_MTU;
-          tud_control_xfer(rhport, request, (void *) (uintptr_t) &max_datagram_size, sizeof(max_datagram_size));
+          tud_control_xfer(rhport, request, (void *) (uintptr_t) &ncm_interface.max_datagram_size,
+                           sizeof(ncm_interface.max_datagram_size));
         } break;
 
         case NCM_SET_MAX_DATAGRAM_SIZE: {
-          if (stage != CONTROL_STAGE_SETUP) {
-            return true;
+          // The DATA stage of this OUT request is copied into our buffer
+          // asynchronously by the control-transfer machinery, after this
+          // callback returns for the SETUP stage -- the destination must be
+          // a persistent field (ncm_interface.max_datagram_size), not a
+          // stack local, or the write lands on stale/reused stack memory
+          // once the SETUP-stage call frame is gone. Mirrors the existing
+          // NCM_SET_NTB_INPUT_SIZE pattern above.
+          if (stage == CONTROL_STAGE_SETUP) {
+            TU_VERIFY(request->wLength == sizeof(ncm_interface.max_datagram_size), false);
+            tud_control_xfer(rhport, request, (void *) (uintptr_t) &ncm_interface.max_datagram_size,
+                             sizeof(ncm_interface.max_datagram_size));
+          } else if (stage == CONTROL_STAGE_DATA) {
+            if (ncm_interface.max_datagram_size == 0 || ncm_interface.max_datagram_size > CFG_TUD_NET_MTU) {
+              ncm_interface.max_datagram_size = CFG_TUD_NET_MTU;
+            }
           }
-          TU_VERIFY(request->wLength == sizeof(uint16_t), false);
-          uint16_t max_datagram_size = CFG_TUD_NET_MTU;
-          tud_control_xfer(rhport, request, (void *) (uintptr_t) &max_datagram_size, sizeof(max_datagram_size));
         } break;
 
         case NCM_GET_CRC_MODE: {
