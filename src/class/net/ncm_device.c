@@ -1429,10 +1429,15 @@ bool netd_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t 
           if (stage != CONTROL_STAGE_SETUP) {
             return true;
           }
-          if (request->wLength != 0 || request->wValue > 1) {
+          // CRC_MODE is not advertised in NCM_CAPABILITIES (no actual CRC
+          // append/validate exists in the TX/RX datapath), so a compliant
+          // host will never issue this with wValue=1. Reject it explicitly
+          // rather than silently ACKing a mode the device cannot honor, in
+          // case a host tries it anyway without checking the capability bit.
+          if (request->wLength != 0 || request->wValue != 0) {
             return false;
           }
-          ncm_interface.crc_mode = (uint16_t) request->wValue;
+          ncm_interface.crc_mode = 0;
           tud_control_status(rhport, request);
         } break;
 
