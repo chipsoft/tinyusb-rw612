@@ -418,6 +418,7 @@ static xmit_ntb_t *xmit_get_next_ready_ntb(void) {
   }
 
   xmit_ntb_t *r = ncm_interface.xmit_ready_ntb[ncm_interface.xmit_ready_tail];
+  ncm_interface.xmit_ready_ntb[ncm_interface.xmit_ready_tail] = NULL;
   ncm_interface.xmit_ready_tail = (ncm_interface.xmit_ready_tail + 1) % XMIT_NTB_N;
   ncm_interface.xmit_ready_count--;
 
@@ -604,16 +605,22 @@ static void xmit_start_if_possible(uint8_t rhport) {
 static bool xmit_requested_datagram_fits_into_current_ntb(uint16_t datagram_size) {
   TU_LOG_DRV("xmit_requested_datagram_fits_into_current_ntb(%d) - %p %p\n", datagram_size, ncm_interface.xmit_tinyusb_ntb, ncm_interface.xmit_glue_ntb);
 
-  if (ncm_interface.xmit_glue_ntb == NULL) {
+  // Lock across the whole read sequence: xmit_glue_ntb can be concurrently
+  // stolen (set NULL) by xmit_start_if_possible() on the USB task between
+  // the NULL check and the wBlockLength dereference below without this.
+  osal_spin_lock(&s_xmit_glue_lock, false);
+  xmit_ntb_t *ntb = ncm_interface.xmit_glue_ntb;
+  if (ntb == NULL) {
+    osal_spin_unlock(&s_xmit_glue_lock, false);
     return false;
   }
   if (ncm_interface.xmit_glue_ntb_datagram_ndx >= ncm_interface.xmit_max_datagrams) {
+    osal_spin_unlock(&s_xmit_glue_lock, false);
     return false;
   }
-  if (ncm_interface.xmit_glue_ntb->nth.wBlockLength + datagram_size + (uint32_t)XMIT_ALIGN_OFFSET(datagram_size) > (uint32_t)ncm_interface.xmit_max_ntb_size) {
-    return false;
-  }
-  return true;
+  bool fits = ntb->nth.wBlockLength + datagram_size + (uint32_t)XMIT_ALIGN_OFFSET(datagram_size) <= (uint32_t)ncm_interface.xmit_max_ntb_size;
+  osal_spin_unlock(&s_xmit_glue_lock, false);
+  return fits;
 } // xmit_requested_datagram_fits_into_current_ntb
 
 /**
@@ -701,6 +708,7 @@ static recv_ntb_t *recv_get_next_ready_ntb(void) {
   }
 
   recv_ntb_t *r = ncm_interface.recv_ready_ntb[ncm_interface.recv_ready_tail];
+  ncm_interface.recv_ready_ntb[ncm_interface.recv_ready_tail] = NULL;
   ncm_interface.recv_ready_tail = (ncm_interface.recv_ready_tail + 1) % RECV_NTB_N;
   ncm_interface.recv_ready_count--;
 
