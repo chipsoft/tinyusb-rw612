@@ -474,9 +474,19 @@ static void ncm_flush_data_paths(void) {
     xmit_put_ntb_into_free_list(stale_glue_ntb);
   }
 
+  // xmit_ready_ntb[]/head/tail/count are lock-protected everywhere else
+  // (xmit_put_ntb_into_ready_list/xmit_get_next_ready_ntb) since the ring is
+  // shared between the lwIP and USB tasks; this reset must be too, or a
+  // concurrent producer publish (lwIP task, via xmit_setup_next_glue_ntb)
+  // racing this loop could strand a just-published NTB behind a
+  // subsequently zeroed count, making it permanently unreachable to
+  // xmit_get_next_ready_ntb()'s count==0 empty-check.
+  osal_spin_lock(&s_xmit_glue_lock, false);
+  xmit_ntb_t *stale_ready_ntb[XMIT_NTB_N];
+  int stale_ready_count = 0;
   for (int i = 0; i < XMIT_NTB_N; ++i) {
     if (ncm_interface.xmit_ready_ntb[i] != NULL) {
-      xmit_put_ntb_into_free_list(ncm_interface.xmit_ready_ntb[i]);
+      stale_ready_ntb[stale_ready_count++] = ncm_interface.xmit_ready_ntb[i];
       ncm_interface.xmit_ready_ntb[i] = NULL;
     }
   }
@@ -485,6 +495,11 @@ static void ncm_flush_data_paths(void) {
   ncm_interface.xmit_ready_tail = 0;
   ncm_interface.xmit_ready_count = 0;
   #endif
+  osal_spin_unlock(&s_xmit_glue_lock, false);
+
+  for (int i = 0; i < stale_ready_count; ++i) {
+    xmit_put_ntb_into_free_list(stale_ready_ntb[i]);
+  }
 
   // Same rule for the RX path: if the bulk-OUT transfer is still queued in the
   // DCD, do not free its buffer or NULL the owner pointer. Otherwise the host's
