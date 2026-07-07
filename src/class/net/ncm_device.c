@@ -1077,6 +1077,13 @@ void netd_init(void) {
   ncm_interface.xmit_max_datagrams = CFG_TUD_NCM_IN_MAX_DATAGRAMS_PER_NTB;
   ncm_interface.max_datagram_size = CFG_TUD_NET_MTU;
 
+  // Seed the NCM_GET_NET_ADDRESS response with the device's actual MAC so a
+  // host that queries it before ever calling NCM_SET_NET_ADDRESS (this
+  // descriptor advertises NCM_NETWORK_CAPS_NET_ADDRESS) gets a valid
+  // 6-byte address instead of a 0-length reply.
+  memcpy(ncm_interface.net_address, tud_network_mac_address, sizeof(tud_network_mac_address));
+  ncm_interface.net_address_len = sizeof(tud_network_mac_address);
+
   for (int i = 0; i < XMIT_NTB_N; ++i) {
     ncm_interface.xmit_free_ntb[i] = &ncm_epbuf.xmit[i].ntb;
   }
@@ -1084,6 +1091,16 @@ void netd_init(void) {
     ncm_interface.recv_free_ntb[i] = &ncm_epbuf.recv[i].ntb;
   }
   ncm_interface.link_is_up = tud_network_default_link_state_cb();
+
+  // s_xmit_inflight_since_millis/s_xmit_stall_reported_for_start are file-static,
+  // not part of ncm_interface, so the memset above does not touch them. Clear
+  // them explicitly: netd_init() runs on every USB reset (via netd_reset()), and
+  // a stale nonzero timestamp surviving a reset would make
+  // tud_network_ncm_tx_stalled() report a phantom stall (it only checks elapsed
+  // time, not whether xmit_tinyusb_ntb -- now NULL -- is actually in flight),
+  // triggering an unwanted BSP watchdog reconnect/reset cycle right after boot.
+  s_xmit_inflight_since_millis = 0;
+  s_xmit_stall_reported_for_start = 0;
 } // netd_init
 
 /**
