@@ -1327,13 +1327,17 @@ bool netd_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t 
           if (stage != CONTROL_STAGE_SETUP) {
             return true;
           }
-          uint16_t xfer_len = request->wLength;
-          if (xfer_len > sizeof(ncm_interface.class_request_data)) {
-            xfer_len = sizeof(ncm_interface.class_request_data);
-          }
+          // This is an OUT (host->device) data stage: the control transfer
+          // machinery expects exactly wLength bytes. Silently clamping the
+          // destination buffer below wLength (instead of rejecting) would
+          // leave leftover host data the EP0 state machine no longer expects,
+          // desyncing the control endpoint for whatever request comes next.
+          // Reject oversized requests instead, matching NCM_SET_NET_ADDRESS's
+          // TU_VERIFY(wLength <= buffer size, ...) pattern above.
+          TU_VERIFY(request->wLength <= sizeof(ncm_interface.class_request_data), false);
 
-          if (xfer_len > 0) {
-            tud_control_xfer(rhport, request, (void *) (uintptr_t) &ncm_interface.class_request_data, xfer_len);
+          if (request->wLength > 0) {
+            tud_control_xfer(rhport, request, (void *) (uintptr_t) &ncm_interface.class_request_data, request->wLength);
           } else {
             tud_control_xfer(rhport, request, NULL, 0);
           }
